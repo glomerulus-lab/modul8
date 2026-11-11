@@ -68,7 +68,23 @@ hebb.add(model.fc, mask=mask, bias=True)
 | `mask` | bool tensor broadcastable to the weight. `True` entries are Hebbian, `False` entries keep their backprop gradient. Default: whole weight. |
 | `bias` | also learn the bias with the rule (pre = 1). Default `False`: bias stays on backprop. |
 | `post` | module whose output is the postsynaptic activity (e.g. the following nonlinearity) instead of the layer's raw output. |
+| `rule` | `"hebb"` (default) or `"oja"`; see below. |
 | `pre_fn`, `post_fn` | transforms applied to the activities before the update (centering, thresholds, ...). |
+
+### Keeping weights bounded: `rule="oja"`
+
+Plain Hebbian growth is unbounded. `ThreeFactor(layer, rule="oja")` adds Oja's
+activity-dependent decay to each unit:
+
+```
+Δw_ij = lr · ( M · post_i · pre_j  −  |M| · post_i² · w_ij )
+```
+
+For a linear unit with a positive modulator this is the modulated Oja rule,
+which drives each unit's weight vector towards unit norm. The decay uses `|M|`
+so that a negative modulator still shrinks the weights instead of growing them.
+The decay acts on the bias too when `bias=True`, and uses the same postsynaptic
+activity as the Hebbian term (so it follows `post=` and `post_fn=`).
 
 ### Behaviour to know
 
@@ -80,8 +96,8 @@ hebb.add(model.fc, mask=mask, bias=True)
   that layer's own gradient is replaced. `loss.backward()` is optional if
   nothing else needs it.
 - Optimizer features (momentum, weight decay, Adam scaling) apply to the
-  Hebbian update as they would to a gradient. Plain Hebbian growth is
-  unbounded, so weight decay or a normalising `post_fn` is usually wanted.
+  Hebbian update as they would to a gradient. With `rule="oja"`, optimizer weight decay is usually
+  unnecessary.
 - `hebb.remove()` detaches the hooks; `ThreeFactor` also works as a context
   manager.
 

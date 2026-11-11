@@ -8,6 +8,11 @@ where ``pre`` is the layer's input, ``post`` its output (or the output of a
 later module such as the nonlinearity), and ``M`` is a global modulatory signal
 (reward, negative error, ...) supplied by the training loop.
 
+With ``rule="oja"`` each unit also gets Oja's activity-dependent decay, which
+keeps its weight norm bounded:
+
+    dw_ij  ∝  M * post_i * pre_j  -  |M| * post_i**2 * w_ij
+
 Activities are captured with forward hooks, so the layers themselves are
 untouched. :meth:`ThreeFactor.modulate` writes the update into ``param.grad``
 (as ``-dw``), replacing whatever backprop put there, so any ``torch.optim``
@@ -30,6 +35,7 @@ _CONV_WEIGHT_GRAD = {
 }
 
 Activity = Callable[[Tensor], Tensor]
+_RULES = ("hebb", "oja")
 
 
 def _is_conv(module: nn.Module) -> bool:
@@ -47,11 +53,14 @@ class _Site:
         post: Optional[nn.Module],
         pre_fn: Optional[Activity],
         post_fn: Optional[Activity],
+        rule: str,
     ):
         if not (isinstance(module, nn.Linear) or _is_conv(module)):
             raise TypeError(
                 f"ThreeFactor supports nn.Linear and nn.Conv1d/2d/3d, got {type(module).__name__}"
             )
+        if rule not in _RULES:
+            raise ValueError(f"rule must be one of {_RULES}, got {rule!r}")
         if bias and module.bias is None:
             raise ValueError("bias=True but the module has no bias")
         if mask is not None:
@@ -66,6 +75,7 @@ class _Site:
         self.bias = bias
         self.pre_fn = pre_fn
         self.post_fn = post_fn
+        self.rule = rule
         self.captures: list[list[Tensor]] = []  # [pre, post] per forward call
         self.enabled = True
 
@@ -135,6 +145,15 @@ class _Site:
             g2 = g.reshape(-1, g.shape[-1])
             dw = g2.t() @ pre.reshape(-1, pre.shape[-1])
             db = g2.sum(0)
+
+        if self.rule == "oja":
+            # Per-unit decay |M| * post^2, averaged like `g`. |M| rather than M
+            # so that a negative modulator can never turn the decay into growth.
+            decay = (mod.abs() * post * post).expand_as(post) / n
+            decay = decay.sum(dim=[d for d in range(post.ndim) if d != ch])
+            dw = dw - decay.reshape(-1, *([1] * (w.ndim - 1))) * w
+            if self.bias:
+                db = db - decay * m.bias
         return dw, db
 
     def modulate(self, modulator: Tensor):
@@ -183,6 +202,9 @@ class ThreeFactor:
         post: module whose output is used as postsynaptic activity instead of
             the layer's own output, e.g. the ReLU that follows it. Must produce
             the same shape as the layer.
+        rule: ``"hebb"`` (default) for the plain rule ``M * post * pre``, or
+            ``"oja"`` to add Oja's decay ``-|M| * post**2 * w``, which bounds
+            each unit's weight norm.
         pre_fn, post_fn: optional transforms applied to the pre/postsynaptic
             activity before the update is computed (e.g. centering).
 
@@ -209,6 +231,7 @@ class ThreeFactor:
         post: Optional[nn.Module] = None,
         pre_fn: Optional[Activity] = None,
         post_fn: Optional[Activity] = None,
+        rule: str = "hebb",
     ):
         self._sites: list[_Site] = []
         if modules is None:
@@ -221,7 +244,9 @@ class ThreeFactor:
         if len(modules) > 1 and (mask is not None or post is not None):
             raise ValueError("`mask` and `post` are per-layer; use add() for each layer")
         for m in modules:
-            self.add(m, mask=mask, bias=bias, post=post, pre_fn=pre_fn, post_fn=post_fn)
+            self.add(
+                m, mask=mask, bias=bias, post=post, pre_fn=pre_fn, post_fn=post_fn, rule=rule
+            )
 
     def add(
         self,
@@ -232,11 +257,12 @@ class ThreeFactor:
         post: Optional[nn.Module] = None,
         pre_fn: Optional[Activity] = None,
         post_fn: Optional[Activity] = None,
+        rule: str = "hebb",
     ) -> "ThreeFactor":
         """Put ``module`` under Hebbian control. Returns ``self`` for chaining."""
         if any(s.module is module for s in self._sites):
             raise ValueError("module is already managed by this ThreeFactor")
-        self._sites.append(_Site(module, mask, bias, post, pre_fn, post_fn))
+        self._sites.append(_Site(module, mask, bias, post, pre_fn, post_fn, rule))
         return self
 
     @torch.no_grad()

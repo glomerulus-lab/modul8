@@ -132,3 +132,46 @@ def test_learns_with_optimizer():
         hebb.modulate(m)
         opt.step()
     assert err() < 0.05 * before
+
+
+@pytest.mark.parametrize("make,shape", [LAYERS[0], LAYERS[3]])
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_oja_decay_term(make, shape, sign):
+    torch.manual_seed(0)
+    layer, x = make(), torch.randn(shape)
+    m = sign * torch.rand(shape[0])
+    mb = m.reshape(-1, *([1] * (len(shape) - 1)))
+    hebb = ThreeFactor(layer, bias=True, rule="oja")
+    out = layer(x).detach()
+    hebb.modulate(m)
+    ch = 1 if out.ndim > 2 else out.ndim - 1
+    n = out.numel() // out.shape[ch]
+    decay = (mb.abs() * out**2).sum(dim=[d for d in range(out.ndim) if d != ch]) / n
+    ref_w, ref_b = reference(layer, x, mb)
+    w = layer.weight.detach()
+    exp_w = ref_w + decay.reshape(-1, *([1] * (w.ndim - 1))) * w
+    assert torch.allclose(layer.weight.grad, exp_w, atol=1e-6)
+    assert torch.allclose(layer.bias.grad, ref_b + decay * layer.bias.detach(), atol=1e-6)
+
+
+def _train_norm(rule, steps=400):
+    torch.manual_seed(0)
+    layer = nn.Linear(8, 4, bias=False)
+    hebb = ThreeFactor(layer, rule=rule)
+    opt = torch.optim.SGD(layer.parameters(), lr=0.05)
+    scale = torch.linspace(0.5, 2.0, 8)
+    for _ in range(steps):
+        layer(torch.randn(64, 8) * scale)
+        hebb.modulate(1.0)
+        opt.step()
+    return layer.weight.detach().norm(dim=1)
+
+
+def test_oja_bounds_weights_where_hebb_explodes():
+    assert _train_norm("hebb").min() > 1e3
+    assert torch.allclose(_train_norm("oja"), torch.ones(4), atol=0.05)
+
+
+def test_rejects_unknown_rule():
+    with pytest.raises(ValueError):
+        ThreeFactor(nn.Linear(2, 2), rule="bcm")
