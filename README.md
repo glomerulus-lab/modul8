@@ -51,9 +51,14 @@ strengthens the current pre/post correlation, so pass a negated error
 
 - a scalar,
 - a 1-D per-sample tensor of shape `(batch,)`,
-- any tensor broadcastable to the postsynaptic activity (per-neuron signals).
+- any tensor broadcastable to the postsynaptic activity (per-neuron signals),
+- a mapping `{layer: M}` giving each managed layer its own signal (it must
+  cover exactly the layers this `ThreeFactor` manages).
 
-The update is averaged over samples and output positions.
+By default the update is averaged over samples and output positions
+(`reduce="all"`). With `reduce="sample"` it is averaged over samples and summed
+over positions, the same scale as the gradient of a per-sample mean loss; this
+is the default when `noise` is set.
 
 ### Options
 
@@ -71,6 +76,7 @@ hebb.add(model.fc, mask=mask, bias=True)
 | `rule` | `"hebb"` (default) or `"oja"`; see below. |
 | `noise` | standard deviation of Gaussian noise added to the layer's output; the noise becomes the postsynaptic factor. See below. |
 | `pre_fn`, `post_fn` | transforms applied to the activities before the update (centering, thresholds, ...). |
+| `reduce` | `"all"` (average over samples and positions) or `"sample"` (average over samples only). Default: `"sample"` with `noise`, else `"all"`. |
 
 ### Keeping weights bounded: `rule="oja"`
 
@@ -150,6 +156,70 @@ Practical notes:
 - A scalar modulator works but gives an estimate scaled by 1/batch with higher
   variance.
 
+### Direct feedback alignment: `DirectFeedback`
+
+A single scalar reward has to assign credit to every unit at once, and its
+variance grows with the number of units. Direct feedback alignment (DFA;
+Nøkland, 2016) gives each unit its own third factor instead: the network's
+output error `e`, projected to the layer through a fixed random matrix `B`.
+
+```
+Δw_ij = −lr · (Bᵀe)_i · f'(a_i) · pre_j
+```
+
+This is still a three-factor rule: the per-neuron modulator is `−(Bᵀe)`, and
+the postsynaptic factor is the derivative of the layer's nonlinearity. No error
+travels backwards through the network, and the matrices `B` are never trained;
+the forward weights come to align with them.
+
+```python
+import torch.nn.functional as F
+from modul8 import DirectFeedback
+
+dfa = DirectFeedback(
+    [model.conv1, model.fc1],          # layers to train with DFA
+    n_out=10,                          # size of the output error
+    posts=[model.relu1, model.relu2],  # each layer's nonlinearity
+    generator=torch.Generator().manual_seed(0),
+)
+
+logits = model(x)
+loss = F.cross_entropy(logits, y)
+opt.zero_grad()
+loss.backward()                        # backprop for the readout
+dfa.modulate(logits.detach().softmax(1) - F.one_hot(y, 10))
+opt.step()
+```
+
+For mean cross-entropy, `softmax − one_hot` is the gradient of the loss with
+respect to the logits (up to the 1/batch that `reduce="sample"` applies). For
+another loss, pass its gradient with respect to the network output.
+
+| option | meaning |
+| --- | --- |
+| `posts` | per layer, the module whose output feeds `derivative` (usually its nonlinearity); `None` uses the layer's own output. |
+| `derivative` | maps that activity to `f'(a)`. Default `relu_derivative`; `tanh_derivative` and `sigmoid_derivative` take the nonlinearity's output. `None` means linear units. |
+| `scale` | entries of `B` are drawn from `N(0, scale² / n_out)`. Default 1. |
+| `bias` | also train the biases. Default `True`. |
+| `reduce` | default `"sample"`: updates are on the scale of a mean-loss gradient, so SGD and Adam both work. |
+| `generator` | `torch.Generator` used to draw `B`, for reproducibility. |
+
+Practical notes:
+
+- Each `B` is created on the first `modulate()`, sized from the layer's actual
+  output (channels × positions for conv layers), on the layer's device and dtype.
+- Results depend on `B`, so seed the `generator` and save the matrices with
+  `dfa.state_dict()` / `dfa.load_state_dict()` alongside your checkpoints.
+- If `B` equals the true backward path (for one hidden layer, the readout's
+  weight), the update is exactly the backprop gradient.
+- DFA works well for fully connected layers and less well for conv layers.
+  Batch norm after each layer usually helps; DFA's update ignores the norm's
+  own derivative.
+- The signal is a biased but deterministic direction, not a noisy estimate, so
+  Adam is fine here (unlike for `noise=`).
+- `paused()`, `reset()`, `enable()` and `remove()` work as for `ThreeFactor`;
+  `DirectFeedback` is also a context manager.
+
 ### Behaviour to know
 
 - Activity is captured on every forward pass while the layer is in **training
@@ -169,7 +239,10 @@ Practical notes:
 
 `examples/mnist_learning_curve.py` trains a LeNet-style convnet on MNIST
 subsets of increasing size and plots test accuracy for backprop, the Hebbian
-and Oja rules, node perturbation, REINFORCE, and a frozen-random-conv control.
+and Oja rules, node perturbation, REINFORCE, direct feedback alignment (`dfa`),
+and a frozen-random control. Every method trains the four hidden layers
+(conv1, conv2, fc1, fc2) its own way; the fc3 readout is always trained by
+backprop.
 
 ```sh
 uv run --group examples python examples/mnist_learning_curve.py
@@ -178,6 +251,13 @@ uv run --group examples python examples/mnist_learning_curve.py
 Add `--dataset fmnist` to use Fashion-MNIST instead (the plot then defaults to
 `fmnist_learning_curve.png`). The per-method learning rates and noise levels
 were tuned on MNIST only.
+
+By default the hidden layers are followed by batch norm with `affine=False`
+(no learnable parameters; `--no-batchnorm` removes it), and the hidden-layer
+learning rate follows a cosine schedule with a 500-step warmup (`--schedule`,
+`--warmup`, `--min-lr-frac`). Each run reports train and test accuracy and
+shows a progress bar (`--eval-every`, `--no-progress`). DFA has its own
+`--dfa-lr` and `--dfa-scale`.
 
 ## Develop
 
