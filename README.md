@@ -323,6 +323,24 @@ shows this alignment per layer next to the accuracy curves. Default
 hyperparameters: SGD (lr 0.1, Nesterov momentum, wd 5e-4) for backprop
 weights, Adam (lr 1e-3) for DFA, cosine schedule with 1 warmup epoch, standard
 crop + flip augmentation. The DFA settings have not been tuned.
+`--dfa-feedback tied` draws each conv's feedback per channel and shares it
+across spatial positions instead of drawing one value per unit.
+
+## Example: DFA on CIFAR-10 VGG nets
+
+`examples/cifar10_vgg_dfa.py` runs the same comparison on the VGG variants of
+Nøkland & Eidnes (2019), including their widened versions (`--feat-mult`):
+
+```sh
+uv run --group examples python examples/cifar10_vgg_dfa.py --arch vgg8b
+uv run --group examples python examples/cifar10_vgg_dfa.py --arch vgg11b --feat-mult 3
+```
+
+The convs are followed by one hidden fully connected layer (`--num-hidden`,
+default 1024), then the backprop-trained readout. Layers are conv → ReLU → BN
+(`affine=False`), as in the other examples, rather than the paper's
+conv → BN → leaky ReLU. `--dropout` adds dropout after each hidden layer. The
+paper's recipes use 0.2 for vgg8b and 0.3 for vgg11b (3x).
 
 ## Develop
 

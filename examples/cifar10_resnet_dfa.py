@@ -310,12 +310,14 @@ def dfa_alignment(model, dfa, layers, x, y) -> list[float]:
 # -- one run -----------------------------------------------------------------
 
 
-def train(method: str, data, args, seed: int, label: str = "") -> dict:
-    """Train one model; return its per-epoch history."""
+def train(method: str, data, args, seed: int, build_model, label: str = "") -> dict:
+    """Train one model, built by `build_model(args)`, and return its per-epoch
+    history. The model must provide `hidden()` ((layer, post) pairs), an `fc`
+    readout and a `hidden_grad` flag, as ResNet does."""
     (x, y), (x_test, y_test) = data
     device = x.device
     torch.manual_seed(seed)
-    model = ResNet(args.arch, batchnorm=args.batchnorm).to(device)
+    model = build_model(args).to(device)
     hidden = model.hidden()
     layers = [layer for layer, _ in hidden]
     hidden_params = [p for layer in layers for p in layer.parameters()]
@@ -446,7 +448,7 @@ def plot(results, args, path: str):
                             [m + s for m, s in zip(mean, sd)], color=color, alpha=0.15, lw=0)
     seeds = len(next(iter(results.values())))
     tidy(ax, "Epoch", "Test accuracy (%)",
-         f"CIFAR-10, {args.arch}" + (f" (mean ± s.d., {seeds} seeds)" if seeds > 1 else ""))
+         f"CIFAR-10, {getattr(args, 'arch_label', args.arch)}" +(f" (mean ± s.d., {seeds} seeds)" if seeds > 1 else ""))
     ax.legend(frameon=False, loc="lower right", labelcolor=ink)
 
     # Right: final DFA/backprop alignment per layer, input to output.
@@ -466,9 +468,9 @@ def plot(results, args, path: str):
     plt.close(fig)
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--arch", choices=list(ARCHS), default="resnet20")
+def add_args(p: argparse.ArgumentParser, archs, default_arch: str):
+    """Command-line options shared by the CIFAR-10 DFA examples."""
+    p.add_argument("--arch", choices=list(archs), default=default_arch)
     p.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     p.add_argument("--seeds", type=int, default=1)
     p.add_argument("--epochs", type=int, default=30)
@@ -512,21 +514,25 @@ def main():
     p.add_argument("--out", help="plot path (default: cifar10_<arch>_dfa.png)")
     p.add_argument("--json", help="also write per-epoch histories to this JSON file")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = p.parse_args()
 
+
+def run(args, build_model):
+    """Train every method for every seed, then print a summary and save the
+    plot (and JSON, if asked)."""
     if args.device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
     (x, y), test = load_cifar10(args.data, args.device)
     if args.train_size:
         x, y = x[:args.train_size], y[:args.train_size]
     if len(x) < args.batch_size:
-        p.error("--train-size must be at least --batch-size")
+        sys.exit("--train-size must be at least --batch-size")
     data = ((x, y), test)
 
     results = {m: [] for m in args.methods}
     for seed in range(args.seeds):
         for method in args.methods:
-            hist = train(method, data, args, seed, label=f"seed {seed}  {method:<6}")
+            hist = train(method, data, args, seed, build_model,
+                         label=f"seed {seed}  {method:<6}")
             results[method].append(hist)
             print(f"seed {seed}  {method:<6} final train {hist['train'][-1]:6.2f}%  "
                   f"test {hist['test'][-1]:6.2f}%  ({hist['time']:.0f}s)\n", flush=True)
@@ -550,6 +556,12 @@ def main():
     out = args.out or f"cifar10_{args.arch}_dfa.png"
     plot(results, args, out)
     print(f"Saved {out}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    add_args(p, ARCHS, "resnet20")
+    run(p.parse_args(), lambda a: ResNet(a.arch, batchnorm=a.batchnorm))
 
 
 if __name__ == "__main__":
