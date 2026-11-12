@@ -13,6 +13,8 @@ The layers are not subclassed or replaced: activity is captured with forward
 hooks, and the update is written into `param.grad`, so your existing optimizer
 applies it.
 
+*Developed with the help of Claude (obviously).*
+
 ## Install
 
 modul8 needs Python ≥ 3.11 and PyTorch ≥ 2.6. Install the PyTorch build you
