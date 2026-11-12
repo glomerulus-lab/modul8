@@ -29,7 +29,7 @@ optimizer applies it.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Callable, Iterable, Optional, Union
+from typing import Callable, Iterable, Mapping, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -44,6 +44,7 @@ _CONV_WEIGHT_GRAD = {
 
 Activity = Callable[[Tensor], Tensor]
 _RULES = ("hebb", "oja")
+_REDUCTIONS = ("all", "sample")
 
 
 def _is_conv(module: nn.Module) -> bool:
@@ -63,6 +64,7 @@ class _Site:
         post_fn: Optional[Activity],
         rule: str,
         noise: float,
+        reduce: Optional[str] = None,
     ):
         if not (isinstance(module, nn.Linear) or _is_conv(module)):
             raise TypeError(
@@ -72,6 +74,10 @@ class _Site:
             raise ValueError(f"rule must be one of {_RULES}, got {rule!r}")
         if noise < 0:
             raise ValueError("noise must be >= 0")
+        if reduce is None:
+            reduce = "sample" if noise > 0 else "all"
+        if reduce not in _REDUCTIONS:
+            raise ValueError(f"reduce must be one of {_REDUCTIONS}, got {reduce!r}")
         if noise > 0 and (post is not None or post_fn is not None or rule != "hebb"):
             raise ValueError(
                 "noise replaces the postsynaptic activity with the injected perturbation, "
@@ -93,6 +99,7 @@ class _Site:
         self.post_fn = post_fn
         self.rule = rule
         self.noise = float(noise)
+        self.reduce = reduce
         # [pre, post] per forward call; with noise, `post` holds xi / sigma.
         self.captures: list[list[Tensor]] = []
         self.enabled = True
@@ -150,11 +157,11 @@ class _Site:
                 )
             mod = mod.reshape(-1, *([1] * (post.ndim - 1)))
 
-        # Third factor times postsynaptic activity, averaged over every
-        # sample and every output position. With noise, average over samples
-        # only (summing positions), so that a per-sample modulator makes the
-        # result an estimate of the true gradient of the mean loss.
-        if self.noise > 0:
+        # Third factor times postsynaptic activity. reduce="all" averages over
+        # every sample and every output position; reduce="sample" (the default
+        # with noise) averages over samples only and sums positions, the same
+        # scaling as the gradient of a per-sample mean loss.
+        if self.reduce == "sample":
             n = post.shape[0] if post.ndim > 1 else 1
         else:
             n = post.numel() // post.shape[ch]
@@ -243,6 +250,10 @@ class ThreeFactor:
             ``rule="oja"``. No noise is added in eval mode or while paused.
         pre_fn, post_fn: optional transforms applied to the pre/postsynaptic
             activity before the update is computed (e.g. centering).
+        reduce: how the update is averaged. ``"all"`` (the default without
+            noise) averages over samples and output positions; ``"sample"``
+            (the default with noise) averages over samples and sums over
+            positions, matching the scale of a mean-loss gradient.
 
     Usage::
 
@@ -269,6 +280,7 @@ class ThreeFactor:
         post_fn: Optional[Activity] = None,
         rule: str = "hebb",
         noise: float = 0.0,
+        reduce: Optional[str] = None,
     ):
         self._sites: list[_Site] = []
         if modules is None:
@@ -283,7 +295,7 @@ class ThreeFactor:
         for m in modules:
             self.add(
                 m, mask=mask, bias=bias, post=post, pre_fn=pre_fn, post_fn=post_fn, rule=rule,
-                noise=noise,
+                noise=noise, reduce=reduce,
             )
 
     def add(
@@ -297,15 +309,18 @@ class ThreeFactor:
         post_fn: Optional[Activity] = None,
         rule: str = "hebb",
         noise: float = 0.0,
+        reduce: Optional[str] = None,
     ) -> "ThreeFactor":
         """Put ``module`` under Hebbian control. Returns ``self`` for chaining."""
         if any(s.module is module for s in self._sites):
             raise ValueError("module is already managed by this ThreeFactor")
-        self._sites.append(_Site(module, mask, bias, post, pre_fn, post_fn, rule, noise))
+        self._sites.append(_Site(module, mask, bias, post, pre_fn, post_fn, rule, noise, reduce))
         return self
 
     @torch.no_grad()
-    def modulate(self, modulator: Union[float, Tensor]) -> None:
+    def modulate(
+        self, modulator: Union[float, Tensor, Mapping[nn.Module, Union[float, Tensor]]]
+    ) -> None:
         """Deliver the third factor and write the Hebbian update into ``.grad``.
 
         Call after ``loss.backward()`` (if any) and before ``optimizer.step()``.
@@ -314,11 +329,24 @@ class ThreeFactor:
             modulator: a scalar, a 1-D per-sample tensor of shape ``(batch,)``,
                 or any tensor broadcastable to the postsynaptic activity
                 (e.g. ``(batch, out_features)`` for a per-neuron signal).
+                Or a mapping ``{layer: modulator}`` giving each managed layer
+                its own signal; it must cover exactly the managed layers.
 
         The update is averaged over samples and output positions, summed over
         all forward passes since the last call, and the captured activity is
         then cleared.
         """
+        if isinstance(modulator, Mapping):
+            managed = {id(s.module) for s in self._sites}
+            given = {id(m) for m in modulator}
+            if given - managed:
+                raise KeyError("modulator given for a layer this ThreeFactor does not manage")
+            if managed - given:
+                raise KeyError("no modulator given for some managed layer(s)")
+            by_id = {id(m): v for m, v in modulator.items()}
+            for site in self._sites:
+                site.modulate(torch.as_tensor(by_id[id(site.module)]).detach())
+            return
         modulator = torch.as_tensor(modulator).detach()
         for site in self._sites:
             site.modulate(modulator)

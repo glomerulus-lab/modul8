@@ -14,7 +14,10 @@ fc2 -- learn; the final fc3 readout is always trained by backprop):
                by (clean loss - noisy loss) per sample; two forward passes
     reinforce  the same noise, modulated by (running-average loss - noisy
                loss) per sample; one forward pass
-    frozen     hidden layers left at their random initialisation (control: a
+    dfa        direct feedback alignment: each hidden neuron's third factor is
+               the output error (softmax - one-hot) sent through a fixed
+               random matrix; the postsynaptic factor is relu'(a)
+    frozen    hidden layers left at their random initialisation (control: a
                method must beat this to be learning useful features)
 
 For hebb, oja and reinforce the third factor is a per-sample reward prediction
@@ -37,15 +40,16 @@ import torch.nn.functional as F
 from torch import nn
 from torchvision import datasets
 
-from modul8 import ThreeFactor
+from modul8 import DirectFeedback, ThreeFactor
 
-METHODS = ("gd", "hebb", "oja", "np", "reinforce", "frozen")
+METHODS = ("gd", "hebb", "oja", "np", "reinforce", "dfa", "frozen")
 LABELS = {
     "gd": "Backprop",
     "hebb": "3-factor Hebbian",
     "oja": "3-factor Oja",
     "np": "Node perturbation",
     "reinforce": "REINFORCE",
+    "dfa": "Direct feedback alignment",
     "frozen": "Frozen random hidden",
 }
 
@@ -133,6 +137,7 @@ def train(method: str, x, y, x_test, y_test, args, seed: int,
     # The fc3 readout is always trained by backprop.
     opts = [torch.optim.Adam(model.fc3.parameters(), lr=args.lr)]
     hebb = None
+    dfa = None
     if method == "gd":
         opts.append(torch.optim.Adam(hidden_params, lr=args.lr))
     elif method in ("hebb", "oja"):
@@ -148,6 +153,13 @@ def train(method: str, x, y, x_test, y_test, args, seed: int,
                      else (args.reinforce_noise, args.reinforce_lr))
         hebb = ThreeFactor(layers, noise=noise, bias=True)
         opts.append(torch.optim.SGD(hidden_params, lr=lr))
+    elif method == "dfa":
+        dfa = DirectFeedback(layers, n_out=10, posts=[relu for _, relu in hidden],
+                             scale=args.dfa_scale,
+                             generator=torch.Generator().manual_seed(seed))
+        # The DFA signal is a deterministic (if biased) descent direction, so
+        # Adam is fine here, unlike for the noisy perturbation estimates.
+        opts.append(torch.optim.Adam(hidden_params, lr=args.dfa_lr))
     # "frozen": the hidden-layer parameters are in no optimizer.
 
     n = len(x)
@@ -158,11 +170,15 @@ def train(method: str, x, y, x_test, y_test, args, seed: int,
             if method == "np":  # clean pass: no noise, nothing captured
                 with torch.no_grad(), hebb.paused():
                     clean = F.cross_entropy(model(x[idx]), y[idx], reduction="none")
-            losses = F.cross_entropy(model(x[idx]), y[idx], reduction="none")
+            logits = model(x[idx])
+            losses = F.cross_entropy(logits, y[idx], reduction="none")
             for opt in opts:
                 opt.zero_grad()
             losses.mean().backward()
-            if method == "np":
+            if dfa is not None:
+                # Output error e = softmax - one-hot, i.e. dLoss/dlogits per sample.
+                dfa.modulate(logits.detach().softmax(1) - F.one_hot(y[idx], 10))
+            elif method == "np":
                 hebb.modulate(clean - losses.detach())
             elif hebb is not None:
                 mean = losses.mean().item()
@@ -185,6 +201,8 @@ def train(method: str, x, y, x_test, y_test, args, seed: int,
         sys.stderr.write("\r\033[K")  # clear the bar; the caller prints the final line
     if hebb is not None:
         hebb.remove()
+    if dfa is not None:
+        dfa.remove()
     return train_acc, test_acc
 
 
@@ -202,6 +220,7 @@ def plot(results, sizes, path: str, dataset: str):
         "np": ("#eda100", "D"),
         "reinforce": ("#e87ba4", "v"),
         "frozen": ("#008300", "X"),
+        "dfa": ("#7b5ce0", "P"),
     }
 
     fig, ax = plt.subplots(figsize=(7, 4.5), dpi=150, facecolor=surface)
@@ -257,6 +276,9 @@ def main():
                    help="output noise std for reinforce")
     p.add_argument("--reinforce-lr", type=float, default=1e-5,
                    help="SGD lr for reinforce weights")
+    p.add_argument("--dfa-lr", type=float, default=1e-3, help="Adam lr for dfa hidden weights")
+    p.add_argument("--dfa-scale", type=float, default=1.0,
+                   help="scale of the dfa random feedback matrices")
     p.add_argument("--eval-every", type=int, default=0,
                    help="steps between progress evaluations (default: steps // 20)")
     p.add_argument("--eval-samples", type=int, default=10000,
