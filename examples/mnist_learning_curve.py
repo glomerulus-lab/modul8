@@ -1,6 +1,7 @@
 """MNIST learning curves: three-factor Hebbian conv layers vs. gradient descent.
 
-A LeNet-style convnet is trained on subsets of MNIST of increasing size, once
+A LeNet-style convnet is trained on subsets of MNIST (or Fashion-MNIST, with
+``--dataset fmnist``) of increasing size, once
 per method, and test accuracy is plotted against training-set size.
 
 Methods (they differ only in how the two conv layers learn; the fully
@@ -66,13 +67,24 @@ class LeNet(nn.Module):
         return self.fc3(F.relu(self.fc2(F.relu(self.fc1(x)))))
 
 
-def load_mnist(root: str, device):
-    def tensors(train: bool):
-        ds = datasets.MNIST(root, train=train, download=True)
-        x = ds.data.float().div(255).sub(0.1307).div(0.3081).unsqueeze(1)
-        return x.to(device), ds.targets.to(device)
+DATASETS = {
+    "mnist": (datasets.MNIST, "MNIST"),
+    "fmnist": (datasets.FashionMNIST, "Fashion-MNIST"),
+}
 
-    return tensors(True), tensors(False)
+
+def load_dataset(name: str, root: str, device):
+    cls = DATASETS[name][0]
+    train, test = (cls(root, train=t, download=True) for t in (True, False))
+    # Standardise both splits with the training set's statistics.
+    x_train = train.data.float().div(255)
+    mean, std = x_train.mean(), x_train.std()
+
+    def tensors(ds):
+        x = (ds.data.float().div(255) - mean) / std
+        return x.unsqueeze(1).to(device), ds.targets.to(device)
+
+    return tensors(train), tensors(test)
 
 
 @torch.no_grad()
@@ -143,7 +155,7 @@ def train(method: str, x, y, x_test, y_test, args, seed: int) -> float:
     return acc
 
 
-def plot(results, sizes, path: str):
+def plot(results, sizes, path: str, dataset: str):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -178,7 +190,7 @@ def plot(results, sizes, path: str):
     ax.set_xlabel("Training examples", color=ink)
     ax.set_ylabel("Test accuracy (%)", color=ink)
     seeds = len(next(iter(results.values()))[0])
-    ax.set_title("MNIST learning curves, LeNet" +
+    ax.set_title(f"{DATASETS[dataset][1]} learning curves, LeNet" +
                  (f" (mean ± s.d., {seeds} seeds)" if seeds > 1 else ""),
                  color=ink, loc="left", fontsize=11)
     ax.grid(axis="y", color=grid, lw=0.8)
@@ -212,12 +224,14 @@ def main():
                    help="output noise std for reinforce")
     p.add_argument("--reinforce-lr", type=float, default=1e-5,
                    help="SGD lr for reinforce weights")
-    p.add_argument("--data", default="data", help="MNIST download directory")
-    p.add_argument("--out", default="mnist_learning_curve.png")
+    p.add_argument("--dataset", choices=list(DATASETS), default="mnist",
+                   help="mnist or fmnist (Fashion-MNIST)")
+    p.add_argument("--data", default="data", help="dataset download directory")
+    p.add_argument("--out", help="plot path (default: <dataset>_learning_curve.png)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
-    (x, y), (x_test, y_test) = load_mnist(args.data, args.device)
+    (x, y), (x_test, y_test) = load_dataset(args.dataset, args.data, args.device)
     sizes = sorted(min(s, len(x)) for s in args.sizes)
     results = {m: [[] for _ in sizes] for m in args.methods}
 
@@ -238,8 +252,9 @@ def main():
     for i, n in enumerate(sizes):
         print(f"{n:>7}  " + "  ".join(f"{statistics.fmean(results[m][i]):9.2f}" for m in args.methods))
 
-    plot(results, sizes, args.out)
-    print(f"\nSaved {args.out}")
+    out = args.out or f"{args.dataset}_learning_curve.png"
+    plot(results, sizes, out, args.dataset)
+    print(f"\nSaved {out}")
 
 
 if __name__ == "__main__":

@@ -175,6 +175,10 @@ and Oja rules, node perturbation, REINFORCE, and a frozen-random-conv control.
 uv run --group examples python examples/mnist_learning_curve.py
 ```
 
+Add `--dataset fmnist` to use Fashion-MNIST instead (the plot then defaults to
+`fmnist_learning_curve.png`). The per-method learning rates and noise levels
+were tuned on MNIST only.
+
 ## Develop
 
 ```sh
