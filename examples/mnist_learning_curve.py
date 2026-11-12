@@ -57,7 +57,9 @@ LABELS = {
 class LeNet(nn.Module):
     def __init__(self, batchnorm: bool = False):
         super().__init__()
-        # Optional batch norm between each hidden layer and its ReLU. It has
+        # Optional batch norm after each hidden layer's ReLU (layer -> ReLU ->
+        # BN), so the ReLU's derivative is the layer's exact local derivative
+        # (which DFA relies on) and BN only standardises the next layer's input. It has
         # no learnable scale/shift (affine=False), so it only standardises
         # activity and adds no parameters for any method to train.
         def bn(cls, c):
@@ -78,11 +80,11 @@ class LeNet(nn.Module):
         self.fc3 = nn.Linear(84, 10)
 
     def forward(self, x):
-        x = F.max_pool2d(self.relu1(self.bn1(self.conv1(x))), 2)
-        x = F.max_pool2d(self.relu2(self.bn2(self.conv2(x))), 2)
+        x = F.max_pool2d(self.bn1(self.relu1(self.conv1(x))), 2)
+        x = F.max_pool2d(self.bn2(self.relu2(self.conv2(x))), 2)
         x = x.flatten(1)
-        x = self.relu3(self.bn3(self.fc1(x)))
-        x = self.relu4(self.bn4(self.fc2(x)))
+        x = self.bn3(self.relu3(self.fc1(x)))
+        x = self.bn4(self.relu4(self.fc2(x)))
         return self.fc3(x)
 
     def hidden(self):
@@ -317,7 +319,7 @@ def main():
                    help="SGD lr for reinforce weights")
     p.add_argument("--dfa-lr", type=float, default=1e-3, help="Adam lr for dfa hidden weights")
     p.add_argument("--batchnorm", action=argparse.BooleanOptionalAction, default=True,
-                   help="batch norm (affine=False) between each hidden layer and its ReLU")
+                   help="batch norm (affine=False) after each hidden layer's ReLU")
     p.add_argument("--schedule", choices=("constant", "cosine", "step"), default="cosine",
                    help="lr schedule for the hidden-layer optimizer")
     p.add_argument("--warmup", type=int, default=500, help="linear warmup steps for the schedule")

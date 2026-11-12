@@ -252,8 +252,10 @@ Add `--dataset fmnist` to use Fashion-MNIST instead (the plot then defaults to
 `fmnist_learning_curve.png`). The per-method learning rates and noise levels
 were tuned on MNIST only.
 
-By default the hidden layers are followed by batch norm with `affine=False`
-(no learnable parameters; `--no-batchnorm` removes it), and the hidden-layer
+By default each hidden layer's ReLU is followed by batch norm with
+`affine=False` (layer → ReLU → BN; no learnable parameters; `--no-batchnorm`
+removes it). BN sits after the ReLU so that, for DFA, the ReLU's derivative is
+still the layer's exact local derivative. The hidden-layer
 learning rate follows a cosine schedule with a 500-step warmup (`--schedule`,
 `--warmup`, `--min-lr-frac`). Each run reports train and test accuracy and
 shows a progress bar (`--eval-every`, `--no-progress`). DFA has its own
