@@ -55,23 +55,35 @@ LABELS = {
 
 
 class LeNet(nn.Module):
-    def __init__(self):
+    def __init__(self, batchnorm: bool = False):
         super().__init__()
+        # Optional batch norm between each hidden layer and its ReLU. It has
+        # no learnable scale/shift (affine=False), so it only standardises
+        # activity and adds no parameters for any method to train.
+        def bn(cls, c):
+            return cls(c, affine=False) if batchnorm else nn.Identity()
+
         self.conv1 = nn.Conv2d(1, 6, 5, padding=2)
+        self.bn1 = bn(nn.BatchNorm2d, 6)
         self.relu1 = nn.ReLU()
         self.conv2 = nn.Conv2d(6, 16, 5)
+        self.bn2 = bn(nn.BatchNorm2d, 16)
         self.relu2 = nn.ReLU()
         self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.bn3 = bn(nn.BatchNorm1d, 120)
         self.relu3 = nn.ReLU()
         self.fc2 = nn.Linear(120, 84)
+        self.bn4 = bn(nn.BatchNorm1d, 84)
         self.relu4 = nn.ReLU()
         self.fc3 = nn.Linear(84, 10)
 
     def forward(self, x):
-        x = F.max_pool2d(self.relu1(self.conv1(x)), 2)
-        x = F.max_pool2d(self.relu2(self.conv2(x)), 2)
+        x = F.max_pool2d(self.relu1(self.bn1(self.conv1(x))), 2)
+        x = F.max_pool2d(self.relu2(self.bn2(self.conv2(x))), 2)
         x = x.flatten(1)
-        return self.fc3(self.relu4(self.fc2(self.relu3(self.fc1(x)))))
+        x = self.relu3(self.bn3(self.fc1(x)))
+        x = self.relu4(self.bn4(self.fc2(x)))
+        return self.fc3(x)
 
     def hidden(self):
         """(layer, following ReLU) for every layer except the fc3 readout."""
@@ -148,7 +160,7 @@ def train(method: str, x, y, x_test, y_test, args, seed: int,
     # the final numbers use the whole training set.
     x_probe, y_probe = x[:args.eval_samples], y[:args.eval_samples]
     torch.manual_seed(seed)
-    model = LeNet().to(x.device)
+    model = LeNet(batchnorm=args.batchnorm).to(x.device)
     hidden = model.hidden()
     layers = [layer for layer, _ in hidden]
     hidden_params = [p for layer in layers for p in layer.parameters()]
@@ -304,9 +316,11 @@ def main():
     p.add_argument("--reinforce-lr", type=float, default=1e-5,
                    help="SGD lr for reinforce weights")
     p.add_argument("--dfa-lr", type=float, default=1e-3, help="Adam lr for dfa hidden weights")
-    p.add_argument("--schedule", choices=("constant", "cosine", "step"), default="constant",
+    p.add_argument("--batchnorm", action=argparse.BooleanOptionalAction, default=True,
+                   help="batch norm (affine=False) between each hidden layer and its ReLU")
+    p.add_argument("--schedule", choices=("constant", "cosine", "step"), default="cosine",
                    help="lr schedule for the hidden-layer optimizer")
-    p.add_argument("--warmup", type=int, default=0, help="linear warmup steps for the schedule")
+    p.add_argument("--warmup", type=int, default=500, help="linear warmup steps for the schedule")
     p.add_argument("--min-lr-frac", type=float, default=0.0,
                    help="final lr as a fraction of the initial lr")
     p.add_argument("--schedule-readout", action="store_true",
