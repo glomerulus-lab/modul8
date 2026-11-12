@@ -261,6 +261,45 @@ learning rate follows a cosine schedule with a 500-step warmup (`--schedule`,
 shows a progress bar (`--eval-every`, `--no-progress`). DFA has its own
 `--dfa-lr` and `--dfa-scale`.
 
+Results on the full Fashion-MNIST training set (60,000 images, batch 128,
+30,000 steps, other options at their defaults; mean over 3 seeds, test ± s.d.):
+
+| method | train (%) | test (%) | gap (pp) |
+| --- | ---: | ---: | ---: |
+| Backprop (`gd`) | 100.00 | 90.41 ± 0.30 | 9.59 |
+| Direct feedback alignment (`dfa`) | 93.74 | 89.02 ± 0.14 | 4.72 |
+| Node perturbation (`np`) | 79.37 | 78.08 ± 0.60 | 1.29 |
+| Frozen random hidden (`frozen`) | 74.89 | 73.78 ± 0.91 | 1.11 |
+
+```sh
+uv run --group examples python examples/mnist_learning_curve.py --dataset fmnist \
+    --sizes 60000 --seeds 3 --methods gd frozen np dfa --batch-size 128 --steps 30000
+```
+
+## Example: DFA on CIFAR-10 ResNets
+
+`examples/cifar10_resnet_dfa.py` trains a CIFAR-style ResNet (`--arch`
+`resnet20/32/44/56/110` or `resnet18/34`) on CIFAR-10 with backprop (`gd`),
+DFA (`dfa`) and a frozen-random control (`frozen`). Every conv, including the
+stem and the 1x1 projection shortcuts, is trained the method's way; the linear
+readout is always trained by backprop.
+
+```sh
+uv run --group examples python examples/cifar10_resnet_dfa.py --arch resnet20
+```
+
+Each block is `BN(ReLU(conv1(x)))`, then `BN(ReLU(conv2(h) + shortcut(x)))`,
+with `affine=False` batch norm after the ReLU as in the MNIST example. A
+block's conv2 and projection shortcut feed the same units, so they share one
+feedback matrix (`--no-share-shortcut-feedback` gives each its own). For
+`dfa` and `frozen` the hidden layers run without autograd, so no backward pass
+goes through the network. Every `--align-every` epochs the script reports the
+cosine between each layer's DFA update and its true gradient, and the plot
+shows this alignment per layer next to the accuracy curves. Default
+hyperparameters: SGD (lr 0.1, Nesterov momentum, wd 5e-4) for backprop
+weights, Adam (lr 1e-3) for DFA, cosine schedule with 1 warmup epoch, standard
+crop + flip augmentation. The DFA settings have not been tuned.
+
 ## Develop
 
 ```sh
