@@ -1,21 +1,21 @@
-"""MNIST learning curves: three-factor Hebbian conv layers vs. gradient descent.
+"""MNIST learning curves: three-factor Hebbian hidden layers vs. gradient descent.
 
 A LeNet-style convnet is trained on subsets of MNIST (or Fashion-MNIST, with
 ``--dataset fmnist``) of increasing size, once
 per method, and test accuracy is plotted against training-set size.
 
-Methods (they differ only in how the two conv layers learn; the fully
-connected layers are always trained by backprop):
+Methods (they differ only in how the hidden layers -- conv1, conv2, fc1 and
+fc2 -- learn; the final fc3 readout is always trained by backprop):
 
-    gd         conv layers trained by backprop (the usual network)
-    hebb       conv layers trained by the plain three-factor rule
-    oja        conv layers trained by the three-factor rule with Oja decay
-    np         node perturbation: noise on the conv outputs, modulated by
-               (clean loss - noisy loss) per sample; two forward passes
+    gd         hidden layers trained by backprop (the usual network)
+    hebb       hidden layers trained by the plain three-factor rule
+    oja        hidden layers trained by the three-factor rule with Oja decay
+    np         node perturbation: noise on the hidden-layer outputs, modulated
+               by (clean loss - noisy loss) per sample; two forward passes
     reinforce  the same noise, modulated by (running-average loss - noisy
                loss) per sample; one forward pass
-    frozen     conv layers left at their random initialisation (control: a
-               method must beat this to be learning useful conv features)
+    frozen     hidden layers left at their random initialisation (control: a
+               method must beat this to be learning useful features)
 
 For hebb, oja and reinforce the third factor is a per-sample reward prediction
 error: a running average of the loss minus that sample's loss.
@@ -46,7 +46,7 @@ LABELS = {
     "oja": "3-factor Oja",
     "np": "Node perturbation",
     "reinforce": "REINFORCE",
-    "frozen": "Frozen random conv",
+    "frozen": "Frozen random hidden",
 }
 
 
@@ -58,14 +58,21 @@ class LeNet(nn.Module):
         self.conv2 = nn.Conv2d(6, 16, 5)
         self.relu2 = nn.ReLU()
         self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.relu3 = nn.ReLU()
         self.fc2 = nn.Linear(120, 84)
+        self.relu4 = nn.ReLU()
         self.fc3 = nn.Linear(84, 10)
 
     def forward(self, x):
         x = F.max_pool2d(self.relu1(self.conv1(x)), 2)
         x = F.max_pool2d(self.relu2(self.conv2(x)), 2)
         x = x.flatten(1)
-        return self.fc3(F.relu(self.fc2(F.relu(self.fc1(x)))))
+        return self.fc3(self.relu4(self.fc2(self.relu3(self.fc1(x)))))
+
+    def hidden(self):
+        """(layer, following ReLU) for every layer except the fc3 readout."""
+        return [(self.conv1, self.relu1), (self.conv2, self.relu2),
+                (self.fc1, self.relu3), (self.fc2, self.relu4)]
 
 
 DATASETS = {
@@ -119,29 +126,29 @@ def train(method: str, x, y, x_test, y_test, args, seed: int,
     x_probe, y_probe = x[:args.eval_samples], y[:args.eval_samples]
     torch.manual_seed(seed)
     model = LeNet().to(x.device)
-    convs = [model.conv1, model.conv2]
-    conv_params = [p for c in convs for p in c.parameters()]
-    conv_ids = {id(p) for p in conv_params}
-    rest = [p for p in model.parameters() if id(p) not in conv_ids]
+    hidden = model.hidden()
+    layers = [layer for layer, _ in hidden]
+    hidden_params = [p for layer in layers for p in layer.parameters()]
 
-    opts = [torch.optim.Adam(rest, lr=args.lr)]
+    # The fc3 readout is always trained by backprop.
+    opts = [torch.optim.Adam(model.fc3.parameters(), lr=args.lr)]
     hebb = None
     if method == "gd":
-        opts.append(torch.optim.Adam(conv_params, lr=args.lr))
+        opts.append(torch.optim.Adam(hidden_params, lr=args.lr))
     elif method in ("hebb", "oja"):
         hebb = ThreeFactor()
-        hebb.add(model.conv1, post=model.relu1, rule=method)
-        hebb.add(model.conv2, post=model.relu2, rule=method)
-        # Plain SGD on the conv weights: the step is exactly lr * (Hebbian update).
-        opts.append(torch.optim.SGD([c.weight for c in convs], lr=args.hebb_lr))
+        for layer, relu in hidden:
+            hebb.add(layer, post=relu, rule=method)
+        # Plain SGD on the weights: the step is exactly lr * (Hebbian update).
+        opts.append(torch.optim.SGD([layer.weight for layer in layers], lr=args.hebb_lr))
     elif method in ("np", "reinforce"):
         # The update is a noisy estimate of the gradient. Plain SGD averages
         # that noise out over steps; Adam would rescale it to full-size steps.
         noise, lr = ((args.np_noise, args.np_lr) if method == "np"
                      else (args.reinforce_noise, args.reinforce_lr))
-        hebb = ThreeFactor(convs, noise=noise, bias=True)
-        opts.append(torch.optim.SGD(conv_params, lr=lr))
-    # "frozen": the conv parameters are in no optimizer.
+        hebb = ThreeFactor(layers, noise=noise, bias=True)
+        opts.append(torch.optim.SGD(hidden_params, lr=lr))
+    # "frozen": the hidden-layer parameters are in no optimizer.
 
     n = len(x)
     baseline = None
