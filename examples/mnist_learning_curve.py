@@ -120,6 +120,25 @@ def progress(label: str, step: int, total: int, train_acc: float, test_acc: floa
     sys.stderr.flush()
 
 
+def make_schedule(opt, args):
+    """Linear warmup over --warmup steps, then cosine or step decay to
+    --min-lr-frac of the initial lr at --steps."""
+    import math
+
+    total, warmup, floor = args.steps, args.warmup, args.min_lr_frac
+
+    def factor(step: int) -> float:
+        if step < warmup:
+            return (step + 1) / warmup
+        t = min(1.0, (step - warmup) / max(1, total - warmup))
+        if args.schedule == "cosine":
+            return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * t))
+        # "step": divide by 10 at 50% and again at 75% of the post-warmup steps.
+        return max(floor, 0.1 ** ((t >= 0.5) + (t >= 0.75)))
+
+    return torch.optim.lr_scheduler.LambdaLR(opt, factor)
+
+
 def train(method: str, x, y, x_test, y_test, args, seed: int,
           label: str = "") -> tuple[float, float]:
     """Train one model; return (train accuracy, test accuracy) in percent."""
@@ -162,6 +181,12 @@ def train(method: str, x, y, x_test, y_test, args, seed: int,
         opts.append(torch.optim.Adam(hidden_params, lr=args.dfa_lr))
     # "frozen": the hidden-layer parameters are in no optimizer.
 
+    # Learning-rate schedule, stepped once per optimizer step. By default it
+    # applies to the hidden-layer optimizer only (opts[1:]); the readout keeps
+    # a constant lr unless --schedule-readout is given.
+    scheduled = opts if args.schedule_readout else opts[1:]
+    schedulers = [make_schedule(opt, args) for opt in scheduled] if args.schedule != "constant" else []
+
     n = len(x)
     baseline = None
     step = 0
@@ -186,6 +211,8 @@ def train(method: str, x, y, x_test, y_test, args, seed: int,
                 hebb.modulate(baseline - losses.detach())  # per-sample reward signal
             for opt in opts:
                 opt.step()
+            for sched in schedulers:
+                sched.step()
             step += 1
             if args.progress and step % eval_every == 0 and step < args.steps:
                 progress(label, step, args.steps, accuracy(model, x_probe, y_probe),
@@ -277,6 +304,13 @@ def main():
     p.add_argument("--reinforce-lr", type=float, default=1e-5,
                    help="SGD lr for reinforce weights")
     p.add_argument("--dfa-lr", type=float, default=1e-3, help="Adam lr for dfa hidden weights")
+    p.add_argument("--schedule", choices=("constant", "cosine", "step"), default="constant",
+                   help="lr schedule for the hidden-layer optimizer")
+    p.add_argument("--warmup", type=int, default=0, help="linear warmup steps for the schedule")
+    p.add_argument("--min-lr-frac", type=float, default=0.0,
+                   help="final lr as a fraction of the initial lr")
+    p.add_argument("--schedule-readout", action="store_true",
+                   help="also apply the schedule to the fc3 readout optimizer")
     p.add_argument("--dfa-scale", type=float, default=1.0,
                    help="scale of the dfa random feedback matrices")
     p.add_argument("--eval-every", type=int, default=0,
