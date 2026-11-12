@@ -98,7 +98,8 @@ def accuracy(model, x, y) -> float:
     return 100.0 * correct / len(y)
 
 
-def train(method: str, x, y, x_test, y_test, args, seed: int) -> float:
+def train(method: str, x, y, x_test, y_test, args, seed: int) -> tuple[float, float]:
+    """Train one model; return (train accuracy, test accuracy) in percent."""
     torch.manual_seed(seed)
     model = LeNet().to(x.device)
     convs = [model.conv1, model.conv2]
@@ -149,10 +150,12 @@ def train(method: str, x, y, x_test, y_test, args, seed: int) -> float:
             if step >= args.steps:
                 break
 
-    acc = accuracy(model, x_test, y_test)
+    # Eval mode: no noise is injected, so both are clean accuracies.
+    train_acc = accuracy(model, x, y)
+    test_acc = accuracy(model, x_test, y_test)
     if hebb is not None:
         hebb.remove()
-    return acc
+    return train_acc, test_acc
 
 
 def plot(results, sizes, path: str, dataset: str):
@@ -234,6 +237,7 @@ def main():
     (x, y), (x_test, y_test) = load_dataset(args.dataset, args.data, args.device)
     sizes = sorted(min(s, len(x)) for s in args.sizes)
     results = {m: [[] for _ in sizes] for m in args.methods}
+    train_results = {m: [[] for _ in sizes] for m in args.methods}
 
     for seed in range(args.seeds):
         # Same nested subsets for every method: the first n of one permutation.
@@ -242,15 +246,24 @@ def main():
             idx = perm[:n]
             for method in args.methods:
                 t0 = time.time()
-                acc = train(method, x[idx], y[idx], x_test, y_test, args, seed)
+                train_acc, acc = train(method, x[idx], y[idx], x_test, y_test, args, seed)
                 results[method][i].append(acc)
-                print(f"seed {seed}  n={n:>6}  {method:<9} {acc:6.2f}%  ({time.time() - t0:.0f}s)",
-                      flush=True)
+                train_results[method][i].append(train_acc)
+                print(f"seed {seed}  n={n:>6}  {method:<9} train {train_acc:6.2f}%  "
+                      f"test {acc:6.2f}%  ({time.time() - t0:.0f}s)", flush=True)
 
-    print("\nTest accuracy (%), mean over seeds")
-    print(f"{'n':>7}  " + "  ".join(f"{m:>9}" for m in args.methods))
-    for i, n in enumerate(sizes):
-        print(f"{n:>7}  " + "  ".join(f"{statistics.fmean(results[m][i]):9.2f}" for m in args.methods))
+    def table(title, res):
+        print(f"\n{title}, mean over seeds")
+        print(f"{'n':>7}  " + "  ".join(f"{m:>9}" for m in args.methods))
+        for i, n in enumerate(sizes):
+            print(f"{n:>7}  " + "  ".join(f"{statistics.fmean(res[m][i]):9.2f}"
+                                          for m in args.methods))
+
+    table("Train accuracy (%)", train_results)
+    table("Test accuracy (%)", results)
+    table("Generalisation gap, train - test (pp)",
+          {m: [[a - b for a, b in zip(tr, te)] for tr, te in zip(train_results[m], results[m])]
+           for m in args.methods})
 
     out = args.out or f"{args.dataset}_learning_curve.png"
     plot(results, sizes, out, args.dataset)
