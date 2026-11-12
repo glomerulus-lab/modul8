@@ -23,7 +23,8 @@ affine=False, so it has nothing to train) sits *after* each ReLU:
 so the ReLU's derivative is each conv's exact local derivative, which is what
 DFA uses. conv2 and a projection shortcut feed the same units (their sum), so
 by default they share one feedback matrix (--no-share-shortcut-feedback gives
-each its own).
+each its own). With --dfa-feedback tied, each conv's feedback is drawn per
+channel and shared across spatial positions instead of per unit.
 
 For dfa and frozen no error is backpropagated into the hidden layers at all:
 the features are computed without autograd and only the readout builds a
@@ -247,10 +248,15 @@ def output_shapes(model, layers, device):
 
 
 def feedback_matrices(model, hidden, n_out: int, scale: float, share_shortcut: bool,
-                      generator: torch.Generator, device):
+                      tied: bool, generator: torch.Generator, device):
     """Draw DFA's fixed random matrices B, N(0, scale^2 / n_out), as
     DirectFeedback would, optionally sharing one B between a block's conv2 and
-    its projection shortcut (they feed the same units)."""
+    its projection shortcut (they feed the same units).
+
+    With `tied`, each conv layer's B is drawn per channel (n_out x C) and
+    repeated over its H x W positions, so every position of a channel gets
+    the same error signal -- the structure of the true gradient into the last
+    stage, which the global average pool makes spatially constant."""
     shapes = output_shapes(model, [layer for layer, _ in hidden], device)
     by_post: dict[int, torch.Tensor] = {}
     mats = []
@@ -258,7 +264,12 @@ def feedback_matrices(model, hidden, n_out: int, scale: float, share_shortcut: b
         if share_shortcut and id(post) in by_post:
             mats.append(by_post[id(post)])
             continue
-        B = torch.randn(n_out, math.prod(shape), generator=generator)
+        if tied:
+            c, *spatial = shape
+            B = torch.randn(n_out, c, generator=generator).repeat_interleave(
+                math.prod(spatial), dim=1)
+        else:
+            B = torch.randn(n_out, math.prod(shape), generator=generator)
         B = (B * (scale / math.sqrt(n_out))).to(device=layer.weight.device,
                                                dtype=layer.weight.dtype)
         by_post[id(post)] = B
@@ -319,7 +330,7 @@ def train(method: str, data, args, seed: int, label: str = "") -> dict:
         dfa = DirectFeedback(layers, n_out=10, posts=[post for _, post in hidden])
         dfa.load_state_dict({"feedback": feedback_matrices(
             model, hidden, 10, args.dfa_scale, args.share_shortcut_feedback,
-            torch.Generator().manual_seed(seed), device)})
+            args.dfa_feedback == "tied", torch.Generator().manual_seed(seed), device)})
         opts.append(make_optimizer(hidden_params, args.dfa_opt, args.dfa_lr, args.dfa_wd,
                                    args.momentum))
     else:  # frozen: the hidden parameters are in no optimizer
@@ -482,6 +493,9 @@ def main():
     p.add_argument("--dfa-wd", type=float, default=0.0, help="weight decay for dfa hidden layers")
     p.add_argument("--dfa-scale", type=float, default=1.0,
                    help="scale of the dfa random feedback matrices")
+    p.add_argument("--dfa-feedback", choices=("dense", "tied"), default="dense",
+                   help="dense: an independent random feedback weight for every unit; "
+                        "tied: one per channel, shared across spatial positions")
     p.add_argument("--share-shortcut-feedback", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="one feedback matrix for a block's conv2 and its projection shortcut")
