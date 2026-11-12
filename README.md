@@ -69,6 +69,7 @@ hebb.add(model.fc, mask=mask, bias=True)
 | `bias` | also learn the bias with the rule (pre = 1). Default `False`: bias stays on backprop. |
 | `post` | module whose output is the postsynaptic activity (e.g. the following nonlinearity) instead of the layer's raw output. |
 | `rule` | `"hebb"` (default) or `"oja"`; see below. |
+| `noise` | standard deviation of Gaussian noise added to the layer's output; the noise becomes the postsynaptic factor. See below. |
 | `pre_fn`, `post_fn` | transforms applied to the activities before the update (centering, thresholds, ...). |
 
 ### Keeping weights bounded: `rule="oja"`
@@ -86,6 +87,69 @@ so that a negative modulator still shrinks the weights instead of growing them.
 The decay acts on the bias too when `bias=True`, and uses the same postsynaptic
 activity as the Hebbian term (so it follows `post=` and `post_fn=`).
 
+### Node perturbation and REINFORCE: `noise=σ`
+
+The rules above correlate the modulator with the layer's activity, which is not
+a gradient estimate. With `noise=σ` the layer's output is perturbed on every
+captured forward pass and the perturbation is used as the postsynaptic factor:
+
+```
+forward:  y = layer(x) + σ·ξ,   ξ ~ N(0, 1)
+update:   Δw_ij = lr · M · (ξ_i / σ) · pre_j      (averaged over samples)
+```
+
+Which algorithm this is depends only on the modulator your loop passes. Use a
+**per-sample** modulator of shape `(batch,)`; then the value written to `.grad`
+is an unbiased estimate (for small σ) of the backprop gradient of the mean
+loss, at the same scale.
+
+```python
+hebb = ThreeFactor(model.conv1, noise=0.01, bias=True)
+loss_fn = lambda out, y: F.cross_entropy(out, y, reduction="none")
+```
+
+**Node perturbation**: compare against a noise-free pass. Two forward passes.
+
+```python
+with torch.no_grad(), hebb.paused():        # clean: no noise, nothing captured
+    clean = loss_fn(model(x), y)
+noisy = loss_fn(model(x), y)
+opt.zero_grad()
+noisy.mean().backward()                     # only if other layers use backprop
+hebb.modulate(clean - noisy.detach())
+opt.step()
+```
+
+**REINFORCE**: compare against any baseline that does not depend on the
+noise (a running average, or zero). One forward pass, and the loss need not be
+differentiable; `M` can be any per-sample reward.
+
+```python
+noisy = loss_fn(model(x), y)
+opt.zero_grad()
+noisy.mean().backward()
+hebb.modulate(baseline - noisy.detach())
+opt.step()
+baseline = 0.9 * baseline + 0.1 * noisy.mean().item()
+```
+
+Practical notes:
+
+- **Variance.** Both estimates are unbiased but noisy, and the noise grows with
+  the number of perturbed units. For the two conv layers of LeNet on MNIST
+  (about 6,300 units, batch 64) a single node-perturbation estimate is roughly
+  40 to 160 times larger in norm than the gradient it estimates. Expect to need
+  small learning rates and many more steps than backprop.
+- **Choosing σ.** Node perturbation's estimate does not depend on σ once it is
+  small, so use a small value to keep the forward pass nearly clean. REINFORCE's
+  variance grows as 1/σ², so it needs a larger σ and a smaller learning rate.
+- **Optimizer.** Prefer plain SGD for these weights. Adam rescales a
+  noise-dominated estimate into full-size steps.
+- `noise` cannot be combined with `post`, `post_fn` or `rule="oja"`. No noise
+  is added in eval mode, inside `paused()`, or after `enable(False)`.
+- A scalar modulator works but gives an estimate scaled by 1/batch with higher
+  variance.
+
 ### Behaviour to know
 
 - Activity is captured on every forward pass while the layer is in **training
@@ -100,6 +164,16 @@ activity as the Hebbian term (so it follows `post=` and `post_fn=`).
   unnecessary.
 - `hebb.remove()` detaches the hooks; `ThreeFactor` also works as a context
   manager.
+
+## Example: MNIST learning curves
+
+`examples/mnist_learning_curve.py` trains a LeNet-style convnet on MNIST
+subsets of increasing size and plots test accuracy for backprop, the Hebbian
+and Oja rules, node perturbation, REINFORCE, and a frozen-random-conv control.
+
+```sh
+uv run --group examples python examples/mnist_learning_curve.py
+```
 
 ## Develop
 

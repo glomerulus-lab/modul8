@@ -175,3 +175,75 @@ def test_oja_bounds_weights_where_hebb_explodes():
 def test_rejects_unknown_rule():
     with pytest.raises(ValueError):
         ThreeFactor(nn.Linear(2, 2), rule="bcm")
+
+
+def test_noise_injected_only_when_capturing():
+    torch.manual_seed(0)
+    layer, x = nn.Linear(50, 200), torch.randn(64, 50)
+    clean = layer(x)
+    hebb = ThreeFactor(layer, noise=0.3)
+    diff = layer(x) - clean
+    assert abs(diff.std().item() - 0.3) < 0.02
+    with hebb.paused():
+        assert torch.equal(layer(x), clean)
+    assert not torch.equal(layer(x), clean)  # capture restored after paused()
+    layer.eval()
+    assert torch.equal(layer(x), clean)
+    hebb.remove()
+    layer.train()
+    assert torch.equal(layer(x), clean)
+
+
+def test_noise_update_formula():
+    layer, x = nn.Linear(5, 3), torch.randn(4, 5)
+    m = torch.randn(4)
+    hebb = ThreeFactor(layer, noise=0.5, bias=True)
+    torch.manual_seed(1)
+    layer(x)
+    hebb.modulate(m)
+    torch.manual_seed(1)
+    xi = torch.randn(4, 3)
+    g = m[:, None] * xi / 0.5 / 4
+    assert torch.allclose(layer.weight.grad, -(g.t() @ x), atol=1e-6)
+    assert torch.allclose(layer.bias.grad, -g.sum(0), atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "make,shape",
+    [(lambda: nn.Linear(6, 4), (16, 6)), (lambda: nn.Conv2d(2, 3, 3, padding=1), (16, 2, 5, 5))],
+)
+def test_node_perturbation_estimates_gradient(make, shape):
+    torch.manual_seed(0)
+    layer, x = make(), torch.randn(shape)
+    head = nn.Sequential(nn.Tanh(), nn.Flatten(), nn.LazyLinear(1))
+
+    def losses():
+        return head(layer(x)).pow(2).flatten()
+
+    losses().mean().backward()
+    true_w, true_b = layer.weight.grad.clone(), layer.bias.grad.clone()
+
+    hebb = ThreeFactor(layer, noise=1e-2, bias=True)
+    est_w, est_b = torch.zeros_like(true_w), torch.zeros_like(true_b)
+    draws = 4000
+    with torch.no_grad():
+        with hebb.paused():
+            clean = losses()
+        for _ in range(draws):
+            hebb.modulate(clean - losses())
+            est_w += layer.weight.grad / draws
+            est_b += layer.bias.grad / draws
+
+    cos = torch.nn.functional.cosine_similarity
+    assert cos(est_w.flatten(), true_w.flatten(), dim=0) > 0.95
+    assert cos(est_b, true_b, dim=0) > 0.95
+    # Same scale as the true gradient, not just the same direction.
+    assert 0.8 < est_w.norm() / true_w.norm() < 1.25
+
+
+def test_noise_rejects_incompatible_options():
+    for kwargs in ({"post": nn.ReLU()}, {"post_fn": torch.relu}, {"rule": "oja"}):
+        with pytest.raises(ValueError):
+            ThreeFactor(nn.Linear(2, 2), noise=0.1, **kwargs)
+    with pytest.raises(ValueError):
+        ThreeFactor(nn.Linear(2, 2), noise=-1.0)

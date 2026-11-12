@@ -6,14 +6,18 @@ per method, and test accuracy is plotted against training-set size.
 Methods (they differ only in how the two conv layers learn; the fully
 connected layers are always trained by backprop):
 
-    gd      conv layers trained by backprop (the usual network)
-    hebb    conv layers trained by the plain three-factor rule
-    oja     conv layers trained by the three-factor rule with Oja decay
-    frozen  conv layers left at their random initialisation (control: any
-            Hebbian method should beat this to be doing useful learning)
+    gd         conv layers trained by backprop (the usual network)
+    hebb       conv layers trained by the plain three-factor rule
+    oja        conv layers trained by the three-factor rule with Oja decay
+    np         node perturbation: noise on the conv outputs, modulated by
+               (clean loss - noisy loss) per sample; two forward passes
+    reinforce  the same noise, modulated by (running-average loss - noisy
+               loss) per sample; one forward pass
+    frozen     conv layers left at their random initialisation (control: a
+               method must beat this to be learning useful conv features)
 
-The third factor is a per-sample reward prediction error: a running average of
-the loss minus that sample's loss.
+For hebb, oja and reinforce the third factor is a per-sample reward prediction
+error: a running average of the loss minus that sample's loss.
 
 Run from the repository root:
 
@@ -33,11 +37,13 @@ from torchvision import datasets
 
 from modul8 import ThreeFactor
 
-METHODS = ("gd", "hebb", "oja", "frozen")
+METHODS = ("gd", "hebb", "oja", "np", "reinforce", "frozen")
 LABELS = {
     "gd": "Backprop",
     "hebb": "3-factor Hebbian",
     "oja": "3-factor Oja",
+    "np": "Node perturbation",
+    "reinforce": "REINFORCE",
     "frozen": "Frozen random conv",
 }
 
@@ -98,6 +104,13 @@ def train(method: str, x, y, x_test, y_test, args, seed: int) -> float:
         hebb.add(model.conv2, post=model.relu2, rule=method)
         # Plain SGD on the conv weights: the step is exactly lr * (Hebbian update).
         opts.append(torch.optim.SGD([c.weight for c in convs], lr=args.hebb_lr))
+    elif method in ("np", "reinforce"):
+        # The update is a noisy estimate of the gradient. Plain SGD averages
+        # that noise out over steps; Adam would rescale it to full-size steps.
+        noise, lr = ((args.np_noise, args.np_lr) if method == "np"
+                     else (args.reinforce_noise, args.reinforce_lr))
+        hebb = ThreeFactor(convs, noise=noise, bias=True)
+        opts.append(torch.optim.SGD(conv_params, lr=lr))
     # "frozen": the conv parameters are in no optimizer.
 
     n = len(x)
@@ -105,11 +118,16 @@ def train(method: str, x, y, x_test, y_test, args, seed: int) -> float:
     step = 0
     while step < args.steps:
         for idx in torch.randperm(n, device=x.device).split(args.batch_size):
+            if method == "np":  # clean pass: no noise, nothing captured
+                with torch.no_grad(), hebb.paused():
+                    clean = F.cross_entropy(model(x[idx]), y[idx], reduction="none")
             losses = F.cross_entropy(model(x[idx]), y[idx], reduction="none")
             for opt in opts:
                 opt.zero_grad()
             losses.mean().backward()
-            if hebb is not None:
+            if method == "np":
+                hebb.modulate(clean - losses.detach())
+            elif hebb is not None:
                 mean = losses.mean().item()
                 baseline = mean if baseline is None else 0.9 * baseline + 0.1 * mean
                 hebb.modulate(baseline - losses.detach())  # per-sample reward signal
@@ -136,7 +154,9 @@ def plot(results, sizes, path: str):
         "gd": ("#2a78d6", "o"),
         "hebb": ("#eb6834", "s"),
         "oja": ("#1baf7a", "^"),
-        "frozen": ("#eda100", "D"),
+        "np": ("#eda100", "D"),
+        "reinforce": ("#e87ba4", "v"),
+        "frozen": ("#008300", "X"),
     }
 
     fig, ax = plt.subplots(figsize=(7, 4.5), dpi=150, facecolor=surface)
@@ -183,6 +203,15 @@ def main():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3, help="Adam lr for backprop weights")
     p.add_argument("--hebb-lr", type=float, default=1e-3, help="SGD lr for Hebbian weights")
+    # Node perturbation wants small noise (its modulator shrinks with the noise);
+    # REINFORCE's variance grows as 1/noise^2, so it wants larger noise and a
+    # smaller learning rate.
+    p.add_argument("--np-noise", type=float, default=0.01, help="output noise std for np")
+    p.add_argument("--np-lr", type=float, default=1e-5, help="SGD lr for np weights")
+    p.add_argument("--reinforce-noise", type=float, default=0.1,
+                   help="output noise std for reinforce")
+    p.add_argument("--reinforce-lr", type=float, default=1e-5,
+                   help="SGD lr for reinforce weights")
     p.add_argument("--data", default="data", help="MNIST download directory")
     p.add_argument("--out", default="mnist_learning_curve.png")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -201,13 +230,13 @@ def main():
                 t0 = time.time()
                 acc = train(method, x[idx], y[idx], x_test, y_test, args, seed)
                 results[method][i].append(acc)
-                print(f"seed {seed}  n={n:>6}  {method:<7} {acc:6.2f}%  ({time.time() - t0:.0f}s)",
+                print(f"seed {seed}  n={n:>6}  {method:<9} {acc:6.2f}%  ({time.time() - t0:.0f}s)",
                       flush=True)
 
     print("\nTest accuracy (%), mean over seeds")
-    print(f"{'n':>7}  " + "  ".join(f"{m:>7}" for m in args.methods))
+    print(f"{'n':>7}  " + "  ".join(f"{m:>9}" for m in args.methods))
     for i, n in enumerate(sizes):
-        print(f"{n:>7}  " + "  ".join(f"{statistics.fmean(results[m][i]):7.2f}" for m in args.methods))
+        print(f"{n:>7}  " + "  ".join(f"{statistics.fmean(results[m][i]):9.2f}" for m in args.methods))
 
     plot(results, sizes, args.out)
     print(f"\nSaved {args.out}")

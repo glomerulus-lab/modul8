@@ -13,6 +13,13 @@ keeps its weight norm bounded:
 
     dw_ij  ∝  M * post_i * pre_j  -  |M| * post_i**2 * w_ij
 
+With ``noise=sigma`` the layer's output is perturbed, ``y + sigma * xi``, and
+the perturbation replaces the activity as the postsynaptic factor:
+
+    dw_ij  ∝  M * (xi_i / sigma) * pre_j
+
+which is node perturbation or REINFORCE depending on the modulator supplied.
+
 Activities are captured with forward hooks, so the layers themselves are
 untouched. :meth:`ThreeFactor.modulate` writes the update into ``param.grad``
 (as ``-dw``), replacing whatever backprop put there, so any ``torch.optim``
@@ -21,6 +28,7 @@ optimizer applies it.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Callable, Iterable, Optional, Union
 
 import torch
@@ -54,6 +62,7 @@ class _Site:
         pre_fn: Optional[Activity],
         post_fn: Optional[Activity],
         rule: str,
+        noise: float,
     ):
         if not (isinstance(module, nn.Linear) or _is_conv(module)):
             raise TypeError(
@@ -61,6 +70,13 @@ class _Site:
             )
         if rule not in _RULES:
             raise ValueError(f"rule must be one of {_RULES}, got {rule!r}")
+        if noise < 0:
+            raise ValueError("noise must be >= 0")
+        if noise > 0 and (post is not None or post_fn is not None or rule != "hebb"):
+            raise ValueError(
+                "noise replaces the postsynaptic activity with the injected perturbation, "
+                'so it cannot be combined with `post`, `post_fn` or rule="oja"'
+            )
         if bias and module.bias is None:
             raise ValueError("bias=True but the module has no bias")
         if mask is not None:
@@ -76,7 +92,9 @@ class _Site:
         self.pre_fn = pre_fn
         self.post_fn = post_fn
         self.rule = rule
-        self.captures: list[list[Tensor]] = []  # [pre, post] per forward call
+        self.noise = float(noise)
+        # [pre, post] per forward call; with noise, `post` holds xi / sigma.
+        self.captures: list[list[Tensor]] = []
         self.enabled = True
 
         self.handles = [module.register_forward_hook(self._capture)]
@@ -86,8 +104,14 @@ class _Site:
     # -- hooks ---------------------------------------------------------------
 
     def _capture(self, module, inputs, output):
-        if self.enabled and module.training:
+        if not (self.enabled and module.training):
+            return None
+        if self.noise == 0:
             self.captures.append([inputs[0].detach(), output.detach()])
+            return None
+        xi = torch.randn_like(output)
+        self.captures.append([inputs[0].detach(), xi / self.noise])
+        return output + self.noise * xi  # replaces the layer's output
 
     def _capture_post(self, module, inputs, output):
         if self.enabled and self.module.training and self.captures:
@@ -127,8 +151,13 @@ class _Site:
             mod = mod.reshape(-1, *([1] * (post.ndim - 1)))
 
         # Third factor times postsynaptic activity, averaged over every
-        # sample and every output position.
-        n = post.numel() // post.shape[ch]
+        # sample and every output position. With noise, average over samples
+        # only (summing positions), so that a per-sample modulator makes the
+        # result an estimate of the true gradient of the mean loss.
+        if self.noise > 0:
+            n = post.shape[0] if post.ndim > 1 else 1
+        else:
+            n = post.numel() // post.shape[ch]
         g = (mod * post).expand_as(post) / n
 
         if conv:
@@ -205,6 +234,13 @@ class ThreeFactor:
         rule: ``"hebb"`` (default) for the plain rule ``M * post * pre``, or
             ``"oja"`` to add Oja's decay ``-|M| * post**2 * w``, which bounds
             each unit's weight norm.
+        noise: standard deviation ``sigma`` of Gaussian noise added to the
+            layer's output on every captured forward pass. The update becomes
+            ``M * (xi / sigma) * pre``, averaged over samples: an estimate of
+            the gradient when ``M`` is a per-sample ``clean_loss - noisy_loss``
+            (node perturbation, see :meth:`paused`) or ``baseline - noisy_loss``
+            (REINFORCE). Not combinable with ``post``, ``post_fn`` or
+            ``rule="oja"``. No noise is added in eval mode or while paused.
         pre_fn, post_fn: optional transforms applied to the pre/postsynaptic
             activity before the update is computed (e.g. centering).
 
@@ -232,6 +268,7 @@ class ThreeFactor:
         pre_fn: Optional[Activity] = None,
         post_fn: Optional[Activity] = None,
         rule: str = "hebb",
+        noise: float = 0.0,
     ):
         self._sites: list[_Site] = []
         if modules is None:
@@ -245,7 +282,8 @@ class ThreeFactor:
             raise ValueError("`mask` and `post` are per-layer; use add() for each layer")
         for m in modules:
             self.add(
-                m, mask=mask, bias=bias, post=post, pre_fn=pre_fn, post_fn=post_fn, rule=rule
+                m, mask=mask, bias=bias, post=post, pre_fn=pre_fn, post_fn=post_fn, rule=rule,
+                noise=noise,
             )
 
     def add(
@@ -258,11 +296,12 @@ class ThreeFactor:
         pre_fn: Optional[Activity] = None,
         post_fn: Optional[Activity] = None,
         rule: str = "hebb",
+        noise: float = 0.0,
     ) -> "ThreeFactor":
         """Put ``module`` under Hebbian control. Returns ``self`` for chaining."""
         if any(s.module is module for s in self._sites):
             raise ValueError("module is already managed by this ThreeFactor")
-        self._sites.append(_Site(module, mask, bias, post, pre_fn, post_fn, rule))
+        self._sites.append(_Site(module, mask, bias, post, pre_fn, post_fn, rule, noise))
         return self
 
     @torch.no_grad()
@@ -290,9 +329,28 @@ class ThreeFactor:
             site.captures.clear()
 
     def enable(self, mode: bool = True) -> None:
-        """Turn activity capture on/off (it is also off whenever the layer is in eval mode)."""
+        """Turn activity capture on/off and noise injection on/off (both are also off in eval mode)."""
         for site in self._sites:
             site.enabled = mode
+
+    @contextmanager
+    def paused(self):
+        """Context manager: forward passes inside neither capture activity nor add noise.
+
+        Use it for the clean pass of node perturbation::
+
+            with hebb.paused():
+                clean = loss_fn(model(x), y)
+            noisy = loss_fn(model(x), y)
+            hebb.modulate(clean - noisy)
+        """
+        previous = [site.enabled for site in self._sites]
+        self.enable(False)
+        try:
+            yield self
+        finally:
+            for site, was in zip(self._sites, previous):
+                site.enabled = was
 
     def remove(self) -> None:
         """Remove all hooks, returning the layers to plain backprop."""
