@@ -15,9 +15,31 @@ applies it.
 
 ## Install
 
+modul8 needs Python ≥ 3.11 and PyTorch ≥ 2.6. Install the PyTorch build you
+want (CPU or a specific CUDA version) first, following
+[pytorch.org](https://pytorch.org/get-started/locally/); otherwise the
+installer pulls the default `torch` wheel from PyPI.
+
+With uv, in your project:
+
 ```sh
-uv add /path/to/modul8        # or: uv add git+<repo-url>
+uv add git+https://github.com/glomerulus-lab/modul8
+uv add /path/to/modul8              # or from a local clone
 ```
+
+With pip:
+
+```sh
+pip install git+https://github.com/glomerulus-lab/modul8
+pip install /path/to/modul8         # or from a local clone
+pip install -e /path/to/modul8      # editable, to work on modul8 itself
+```
+
+Then `from modul8 import ThreeFactor, DirectFeedback`.
+
+The `cpu`, `cu124` and `cu134` extras only choose a PyTorch index when working
+inside this repository with uv (see [Develop](#develop)). Elsewhere they just
+add `torchvision`, so install PyTorch yourself as above.
 
 ## Use
 
@@ -303,6 +325,9 @@ crop + flip augmentation. The DFA settings have not been tuned.
 ## Develop
 
 ```sh
-uv sync
+uv sync                     # add --extra cpu, cu124 or cu134 to pick a PyTorch build
 uv run pytest
 ```
+
+Run the examples with `--group examples` (and the same extra), e.g.
+`uv run --extra cu124 --group examples python examples/mnist_learning_curve.py`.
