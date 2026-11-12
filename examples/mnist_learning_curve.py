@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
 import time
 
 import torch
@@ -98,8 +99,24 @@ def accuracy(model, x, y) -> float:
     return 100.0 * correct / len(y)
 
 
-def train(method: str, x, y, x_test, y_test, args, seed: int) -> tuple[float, float]:
+def progress(label: str, step: int, total: int, train_acc: float, test_acc: float, t0: float):
+    """Redraw a one-line progress bar in place on stderr."""
+    width = 24
+    filled = width * step // total
+    bar = "#" * filled + "-" * (width - filled)
+    sys.stderr.write(f"\r{label} [{bar}] {step:>{len(str(total))}}/{total}  "
+                     f"train {train_acc:6.2f}%  test {test_acc:6.2f}%  ({time.time() - t0:.0f}s)")
+    sys.stderr.flush()
+
+
+def train(method: str, x, y, x_test, y_test, args, seed: int,
+          label: str = "") -> tuple[float, float]:
     """Train one model; return (train accuracy, test accuracy) in percent."""
+    t0 = time.time()
+    eval_every = args.eval_every or max(1, args.steps // 100)
+    # Intermediate train accuracy uses a fixed subset so large n stays cheap;
+    # the final numbers use the whole training set.
+    x_probe, y_probe = x[:args.eval_samples], y[:args.eval_samples]
     torch.manual_seed(seed)
     model = LeNet().to(x.device)
     convs = [model.conv1, model.conv2]
@@ -147,12 +164,18 @@ def train(method: str, x, y, x_test, y_test, args, seed: int) -> tuple[float, fl
             for opt in opts:
                 opt.step()
             step += 1
+            if args.progress and step % eval_every == 0 and step < args.steps:
+                progress(label, step, args.steps, accuracy(model, x_probe, y_probe),
+                         accuracy(model, x_test, y_test), t0)
             if step >= args.steps:
                 break
 
     # Eval mode: no noise is injected, so both are clean accuracies.
     train_acc = accuracy(model, x, y)
     test_acc = accuracy(model, x_test, y_test)
+    if args.progress:
+        progress(label, step, args.steps, train_acc, test_acc, t0)
+        sys.stderr.write("\r\033[K")  # clear the bar; the caller prints the final line
     if hebb is not None:
         hebb.remove()
     return train_acc, test_acc
@@ -227,6 +250,12 @@ def main():
                    help="output noise std for reinforce")
     p.add_argument("--reinforce-lr", type=float, default=1e-5,
                    help="SGD lr for reinforce weights")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="steps between progress evaluations (default: steps // 20)")
+    p.add_argument("--eval-samples", type=int, default=10000,
+                   help="training examples used for intermediate train accuracy")
+    p.add_argument("--no-progress", dest="progress", action="store_false",
+                   help="disable the progress bar")
     p.add_argument("--dataset", choices=list(DATASETS), default="mnist",
                    help="mnist or fmnist (Fashion-MNIST)")
     p.add_argument("--data", default="data", help="dataset download directory")
@@ -246,7 +275,8 @@ def main():
             idx = perm[:n]
             for method in args.methods:
                 t0 = time.time()
-                train_acc, acc = train(method, x[idx], y[idx], x_test, y_test, args, seed)
+                train_acc, acc = train(method, x[idx], y[idx], x_test, y_test, args, seed,
+                                       label=f"seed {seed}  n={n:>6}  {method:<9}")
                 results[method][i].append(acc)
                 train_results[method][i].append(train_acc)
                 print(f"seed {seed}  n={n:>6}  {method:<9} train {train_acc:6.2f}%  "
