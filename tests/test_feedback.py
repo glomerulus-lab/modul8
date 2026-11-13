@@ -89,6 +89,74 @@ def test_dfa_with_true_feedback_equals_backprop():
     assert torch.allclose(net.fc1.bias.grad, ref[1], atol=1e-6)
 
 
+class ConvNet(nn.Module):
+    """conv -> relu -> conv -> relu -> fc -> relu -> readout."""
+
+    def __init__(self):
+        super().__init__()
+        self.c1, self.r1 = nn.Conv2d(2, 4, 3, padding=1), nn.ReLU()
+        self.c2, self.r2 = nn.Conv2d(4, 3, 3, stride=2, padding=1), nn.ReLU()
+        self.fc, self.r3 = nn.Linear(3 * 4 * 4, 6), nn.ReLU()
+        self.out = nn.Linear(6, 5)
+
+    def forward(self, x):
+        h = self.r2(self.c2(self.r1(self.c1(x))))
+        return self.out(self.r3(self.fc(h.flatten(1))))
+
+    def hidden(self):
+        return [(self.c1, self.r1), (self.c2, self.r2), (self.fc, self.r3)]
+
+
+def test_dfa_layer_by_layer_matches_all_layers_at_once():
+    """modulate() builds and applies each layer's modulator in turn; the result
+    must equal building every modulator first and delivering them together."""
+    torch.manual_seed(0)
+    net = ConvNet()
+    layers, posts = zip(*net.hidden())
+    x, y = torch.randn(7, 2, 8, 8), torch.randint(0, 5, (7,))
+
+    dfa = DirectFeedback(layers, n_out=5, posts=posts,
+                         generator=torch.Generator().manual_seed(1))
+    logits = net(x)
+    e = logits.detach().softmax(1) - F.one_hot(y, 5)
+    dfa.modulate(e)
+    got = [p.grad.clone() for layer in layers for p in (layer.weight, layer.bias)]
+    feedback = dfa.feedback
+    dfa.remove()
+
+    # Reference: every modulator materialised at once, as a mapping.
+    for layer in layers:
+        layer.zero_grad(set_to_none=True)
+    tf = ThreeFactor()
+    for layer, post in zip(layers, posts):
+        tf.add(layer, post=post, post_fn=lambda p: (p > 0).to(p.dtype), bias=True,
+               reduce="sample")
+    acts = {}
+    hooks = [post.register_forward_hook(lambda m, i, o: acts.__setitem__(m, o))
+             for post in posts]
+    net(x)
+    for h in hooks:
+        h.remove()
+    tf.modulate({layer: -(e @ B).reshape(acts[post].shape)
+                 for layer, post, B in zip(layers, posts, feedback)})
+    want = [p.grad for layer in layers for p in (layer.weight, layer.bias)]
+
+    for g, w in zip(got, want):
+        assert torch.equal(g, w)
+
+
+def test_dfa_failure_leaves_every_layer_untouched():
+    """A layer with no captured activity is detected before any .grad is
+    written, so earlier layers are not half-updated."""
+    a, b = nn.Linear(3, 4), nn.Linear(4, 2)
+    dfa = DirectFeedback([a, b], n_out=2)
+    a(torch.randn(5, 3))  # b never runs
+    with pytest.raises(RuntimeError, match="no activity captured"):
+        dfa.modulate(torch.randn(5, 2))
+    assert a.weight.grad is None and a.bias.grad is None
+    assert dfa.tf._sites[0].captures  # a's activity is still there
+
+
 def test_dfa_creates_feedback_lazily_with_layer_shapes():
     conv, fc = nn.Conv2d(1, 3, 3), nn.Linear(5, 7)
     dfa = DirectFeedback([conv, fc], n_out=10)

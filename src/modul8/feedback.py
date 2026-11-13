@@ -132,8 +132,10 @@ class DirectFeedback:
         if error.ndim != 2 or error.shape[1] != self.n_out:
             raise ValueError(f"error must have shape (batch, {self.n_out}), "
                              f"got {tuple(error.shape)}")
-        mods = {}
-        for i, (layer, site) in enumerate(zip(self.layers, self.tf._sites)):
+        # Validate every layer (and create any missing B) before writing any
+        # .grad, so a failure leaves all layers untouched.
+        mats = []
+        for i, site in enumerate(self.tf._sites):
             if not site.captures:
                 raise RuntimeError(
                     "no activity captured for a layer since the last modulate()/reset(); "
@@ -143,9 +145,15 @@ class DirectFeedback:
             if post.shape[0] != error.shape[0]:
                 raise ValueError(f"error has batch {error.shape[0]} but the layer saw "
                                  f"batch {post.shape[0]}")
-            B = self._matrix(i, post.shape[1:])
-            mods[layer] = -(error.to(B.dtype) @ B).reshape(post.shape)
-        self.tf.modulate(mods)
+            mats.append(self._matrix(i, post.shape[1:]))
+        # One layer at a time: each layer's modulator -(e B) is the size of its
+        # activity, so building it only when needed (and freeing it, along
+        # with the layer's captures, before the next) keeps just one alive at
+        # once. Each update depends only on that layer's own captures, e and
+        # B, so the order cannot change the result.
+        for site, B in zip(self.tf._sites, mats):
+            shape = site.captures[-1][1].shape
+            site.modulate(-(error.to(B.dtype) @ B).reshape(shape))
 
     # -- state ---------------------------------------------------------------
 
