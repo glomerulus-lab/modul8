@@ -342,6 +342,26 @@ default 1024), then the backprop-trained readout. Layers are conv → ReLU → B
 conv → BN → leaky ReLU. `--dropout` adds dropout after each hidden layer. The
 paper's recipes use 0.2 for vgg8b and 0.3 for vgg11b (3x).
 
+Results for vgg8 (full training set, 80 epochs, tied feedback, SGD lr 0.01 for
+backprop weights, Adam lr 0.01 with weight decay 1e-5 for DFA, other options at
+their defaults; mean over 3 seeds):
+
+| method | train (%) | test (%) | best test (%) | gap (pp) |
+| --- | ---: | ---: | ---: | ---: |
+| Backprop (`gd`) | 99.62 | 88.37 | 88.44 | 11.25 |
+| Direct feedback alignment (`dfa`) | 82.05 | 73.03 | 73.15 | 9.02 |
+| Frozen random hidden (`frozen`) | 45.36 | 47.96 | 48.06 | −2.60 |
+
+At the final epoch, the cosine between each DFA update and the backprop
+gradient rises from the first conv to the hidden fully connected layer:
++0.03, +0.11, +0.14, +0.20, +0.23, +0.34.
+
+```sh
+uv run --group examples python examples/cifar10_vgg_dfa.py --arch vgg8 \
+    --methods frozen gd dfa --seeds 3 --epochs 80 --dfa-feedback tied \
+    --lr 0.01 --dfa-lr 0.01 --dfa-wd 1e-5
+```
+
 ## Develop
 
 ```sh
