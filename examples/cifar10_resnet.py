@@ -41,7 +41,7 @@ means the method is not following the global gradient for that layer.
 
 Run from the repository root:
 
-    uv run --group examples python examples/cifar10_resnet_dfa.py --arch resnet20
+    uv run --group examples python examples/cifar10_resnet.py --arch resnet20
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ import math
 import statistics
 import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -424,6 +425,29 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
 # -- reporting ---------------------------------------------------------------
 
 
+def results_frame(results, args):
+    """One row per (method, seed, epoch): accuracies, loss, and the
+    alignment with backprop (mean and per layer; empty on epochs without a
+    probe)."""
+    import pandas as pd
+
+    rows = []
+    for method, runs in results.items():
+        for seed, run in enumerate(runs):
+            align = dict(run["align"])
+            for i, epoch in enumerate(range(1, len(run["test"]) + 1)):
+                row = {"arch": getattr(args, "arch_label", args.arch), "method": method,
+                       "seed": seed, "epoch": epoch, "train": run["train"][i],
+                       "test": run["test"][i], "loss": run["loss"][i],
+                       "run_time": run.get("time")}
+                cos = align.get(epoch)
+                if cos is not None:
+                    row["align_mean"] = statistics.fmean(cos)
+                    row.update({f"align_{k}": c for k, c in enumerate(cos)})
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def final_alignment(results) -> dict[str, list[float]]:
     """Per method, the final-epoch alignment per layer, mean over seeds."""
     out = {}
@@ -557,13 +581,16 @@ def add_args(p: argparse.ArgumentParser, archs, default_arch: str):
                    help="disable the progress bar")
     p.add_argument("--data", default="data", help="dataset download directory")
     p.add_argument("--out", help="plot path (default: cifar10_<arch>_dfa.png)")
+    p.add_argument("--csv", help="per-epoch results table; a timestamp is added to the "
+                                 "name (default: the plot path with .csv)")
     p.add_argument("--json", help="also write per-epoch histories to this JSON file")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
 
 def run(args, build_model):
     """Train every method for every seed, then print a summary and save the
-    plot (and JSON, if asked)."""
+    results table (CSV), the plot (and JSON, if asked). The CSV is rewritten
+    after every run, so a crash keeps the runs finished so far."""
     if args.device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
     (x, y), test = load_cifar10(args.data, args.device)
@@ -572,6 +599,11 @@ def run(args, build_model):
     if len(x) < args.batch_size:
         sys.exit("--train-size must be at least --batch-size")
     data = ((x, y), test)
+    out = args.out or f"cifar10_{args.arch}_dfa.png"
+    # Stamped once, so the per-run rewrites below all go to the same file.
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    base = Path(args.csv) if args.csv else Path(out).with_suffix(".csv")
+    csv = str(base.with_name(f"{base.stem}_{stamp}{base.suffix or '.csv'}"))
 
     results = {m: [] for m in args.methods}
     for seed in range(args.seeds):
@@ -581,6 +613,7 @@ def run(args, build_model):
             results[method].append(hist)
             print(f"seed {seed}  {method:<6} final train {hist['train'][-1]:6.2f}%  "
                   f"test {hist['test'][-1]:6.2f}%  ({hist['time']:.0f}s)\n", flush=True)
+            results_frame(results, args).to_csv(csv, index=False)
 
     print(f"Final accuracy (%), {args.arch}, mean over {args.seeds} seed(s)")
     print(f"{'method':<8} {'train':>8} {'test':>8} {'best test':>10}")
@@ -597,7 +630,7 @@ def run(args, build_model):
         with open(args.json, "w") as f:
             json.dump({"args": vars(args), "results": results}, f, indent=1)
         print(f"\nSaved {args.json}")
-    out = args.out or f"cifar10_{args.arch}_dfa.png"
+    print(f"\nSaved {csv}")
     plot(results, args, out)
     print(f"Saved {out}")
 

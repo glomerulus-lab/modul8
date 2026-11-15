@@ -369,7 +369,7 @@ uv run --group examples python examples/mnist_learning_curve.py --dataset fmnist
 
 ## Example: DFA and local losses on CIFAR-10 ResNets
 
-`examples/cifar10_resnet_dfa.py` trains a CIFAR-style ResNet (`--arch`
+`examples/cifar10_resnet.py` trains a CIFAR-style ResNet (`--arch`
 `resnet20/32/44/56/110` or `resnet18/34`) on CIFAR-10 with backprop (`gd`),
 DFA (`dfa`), local error signals (`local`) and a frozen-random control
 (`frozen`). Every conv, including the
@@ -377,7 +377,7 @@ stem and the 1x1 projection shortcuts, is trained the method's way; the linear
 readout is always trained by backprop.
 
 ```sh
-uv run --group examples python examples/cifar10_resnet_dfa.py --arch resnet20
+uv run --group examples python examples/cifar10_resnet.py --arch resnet20
 ```
 
 Each block is `BN(ReLU(conv1(x)))`, then `BN(ReLU(conv2(h) + shortcut(x)))`,
@@ -398,14 +398,23 @@ Adam lr 5e-4 for the layers and their heads (`--local-opt`, `--local-lr`,
 `--dfa-feedback tied` draws each conv's feedback per channel and shares it
 across spatial positions instead of drawing one value per unit.
 
+Results are saved as a CSV table with one row per method, seed and epoch:
+train and test accuracy, loss, run time, and on probe epochs the mean and
+per-layer (`align_0`, `align_1`, ...) alignment with backprop. By default it
+sits next to the plot with the start time in its name (e.g.
+`cifar10_vgg8_dfa_20261114-183724.csv`), so reruns don't overwrite earlier
+results; `--csv name.csv` picks another base name, which is stamped the same
+way (`name_20261114-183724.csv`). The file is
+rewritten after every finished run.
+
 ## Example: DFA and local losses on CIFAR-10 VGG nets
 
-`examples/cifar10_vgg_dfa.py` runs the same comparison on the VGG variants of
+`examples/cifar10_vgg.py` runs the same comparison on the VGG variants of
 Nøkland & Eidnes (2019), including their widened versions (`--feat-mult`):
 
 ```sh
-uv run --group examples python examples/cifar10_vgg_dfa.py --arch vgg8b
-uv run --group examples python examples/cifar10_vgg_dfa.py --arch vgg11b --feat-mult 3
+uv run --group examples python examples/cifar10_vgg.py --arch vgg8b
+uv run --group examples python examples/cifar10_vgg.py --arch vgg11b --feat-mult 3
 ```
 
 The convs are followed by one hidden fully connected layer (`--num-hidden`,
@@ -431,7 +440,7 @@ gradient rises from the first conv to the hidden fully connected layer:
 +0.03, +0.11, +0.14, +0.20, +0.23, +0.34.
 
 ```sh
-uv run --group examples python examples/cifar10_vgg_dfa.py --arch vgg8 \
+uv run --group examples python examples/cifar10_vgg.py --arch vgg8 \
     --methods frozen gd dfa --seeds 3 --epochs 80 --dfa-feedback tied \
     --lr 0.01 --dfa-lr 0.01 --dfa-wd 1e-5
 ```

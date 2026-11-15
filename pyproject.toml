@@ -57,5 +57,6 @@ dev = [
 ]
 examples = [
     "matplotlib>=3.10.9",
+    "pandas>=3.1.1",
     "torchvision",
 ]

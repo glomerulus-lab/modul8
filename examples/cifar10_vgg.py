@@ -8,7 +8,7 @@ comes one hidden fully connected layer (--num-hidden, 1024 by default, not
 scaled), then the linear readout.
 
 Methods, training loop, alignment probe and plot are those of
-examples/cifar10_resnet_dfa.py (see its docstring): every hidden layer -- each
+examples/cifar10_resnet.py (see its docstring): every hidden layer -- each
 conv and the hidden fc layer -- is trained by the method, and the readout is
 always trained by backprop.
 
@@ -30,8 +30,8 @@ Its recipes use dropout 0.2 for vgg8b and 0.3 for vgg11b (3x) (--dropout).
 
 Run from the repository root:
 
-    uv run --group examples python examples/cifar10_vgg_dfa.py --arch vgg8b
-    uv run --group examples python examples/cifar10_vgg_dfa.py --arch vgg11b --feat-mult 3
+    uv run --group examples python examples/cifar10_vgg.py --arch vgg8b
+    uv run --group examples python examples/cifar10_vgg.py --arch vgg11b --feat-mult 3
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import argparse
 import torch
 from torch import nn
 
-from cifar10_resnet_dfa import add_args, norm, run
+from cifar10_resnet import add_args, norm, run
 
 # Nøkland & Eidnes's configurations: conv widths (before --feat-mult), "M" is
 # a 2x2 max-pool.
