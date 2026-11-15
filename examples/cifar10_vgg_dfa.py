@@ -1,4 +1,4 @@
-"""CIFAR-10 VGG nets trained by direct feedback alignment vs. backprop.
+"""CIFAR-10 VGG nets trained by DFA or local error signals vs. backprop.
 
 The VGG variants are those of Nøkland & Eidnes, "Training Neural Networks
 with Local Error Signals" (ICML 2019; github.com/anokland/local-loss),
@@ -20,6 +20,10 @@ Differences from the paper's networks, to fit this repo's DFA convention:
   * ReLU throughout; the paper's recipes use leaky ReLU.
   * Max-pooling follows the BN (and dropout). DFA ignores the pool, so units
     the pool discards still receive DFA updates.
+  * With `local`, each layer's local loss (the paper's method) reads the
+    ReLU output, before the BN, dropout and pooling; the paper's reads the
+    block's output after BN and the nonlinearity, before dropout. The heads
+    themselves (pred, sim, predsim; --local-loss) follow the paper's code.
 
 The paper trains 400 epochs with Adam; the default here is a 30-epoch run.
 Its recipes use dropout 0.2 for vgg8b and 0.3 for vgg11b (3x) (--dropout).
@@ -95,7 +99,7 @@ class VGG(nn.Module):
                                else nn.Identity(), dropout, spatial=False)
         self.fc = nn.Linear(num_hidden, num_classes)
         # When False, the hidden layers run without autograd: only the readout
-        # gets a backprop gradient (used for dfa and frozen).
+        # gets a backprop gradient (used for dfa, local and frozen).
         self.hidden_grad = True
 
         for m in self.modules():

@@ -11,6 +11,10 @@ is always trained by backprop):
     dfa     direct feedback alignment: each hidden conv's third factor is the
             output error (softmax - one-hot) sent through a fixed random
             matrix B; the postsynaptic factor is relu'(a)
+    local   layer-local error signals (Nøkland & Eidnes, 2019): each hidden
+            layer's error is the gradient of a local loss computed by a small
+            auxiliary head on its ReLU output (--local-loss pred, sim or
+            predsim); no error crosses between layers
     frozen  hidden layers left at their random initialisation (control: a
             method must beat this to be learning useful features)
 
@@ -26,13 +30,14 @@ by default they share one feedback matrix (--no-share-shortcut-feedback gives
 each its own). With --dfa-feedback tied, each conv's feedback is drawn per
 channel and shared across spatial positions instead of per unit.
 
-For dfa and frozen no error is backpropagated into the hidden layers at all:
-the features are computed without autograd and only the readout builds a
-graph, so a training step costs roughly a forward pass plus the DFA update.
+For dfa, local and frozen no error is backpropagated into the hidden layers
+at all: the features are computed without autograd and only the readout (and,
+for local, each layer's head) builds a graph, so a training step costs roughly
+a forward pass plus the per-layer updates.
 
-With --align-every, the cosine between each layer's DFA update and its true
-backprop gradient is measured on a held-out batch: alignment near 0 means DFA
-is not following the gradient for that layer.
+With --align-every, the cosine between each layer's dfa or local update and
+its true backprop gradient is measured on a held-out batch: alignment near 0
+means the method is not following the global gradient for that layer.
 
 Run from the repository root:
 
@@ -53,12 +58,13 @@ import torch.nn.functional as F
 from torch import nn
 from torchvision import datasets
 
-from modul8 import DirectFeedback
+from modul8 import DirectFeedback, LocalLoss
 
-METHODS = ("gd", "dfa", "frozen")
+METHODS = ("gd", "dfa", "local", "frozen")
 LABELS = {
     "gd": "Backprop",
     "dfa": "Direct feedback alignment",
+    "local": "Local error signals",
     "frozen": "Frozen random hidden",
 }
 
@@ -125,7 +131,7 @@ class ResNet(nn.Module):
         self.blocks = nn.Sequential(*layers)
         self.fc = nn.Linear(c, num_classes)
         # When False, the hidden layers run without autograd: only the readout
-        # gets a backprop gradient (used for dfa and frozen).
+        # gets a backprop gradient (used for dfa, local and frozen).
         self.hidden_grad = True
 
         for m in self.modules():
@@ -277,15 +283,17 @@ def feedback_matrices(model, hidden, n_out: int, scale: float, share_shortcut: b
     return mats
 
 
-def dfa_alignment(model, dfa, layers, x, y) -> list[float]:
-    """Cosine between each layer's DFA update and its backprop gradient on
-    (x, y). Leaves parameters, grads and batch-norm statistics unchanged."""
+def alignment(model, rule, deliver, layers, x, y, extra_params=()) -> list[float]:
+    """Cosine between each layer's update from `rule` (a DirectFeedback or
+    LocalLoss; `deliver(logits, y)` calls its modulate) and its backprop
+    gradient on (x, y). Leaves parameters, grads (of the layers, the readout
+    and `extra_params`) and batch-norm statistics unchanged."""
     buffers = {k: v.clone() for k, v in model.named_buffers()}
-    params = [p for layer in layers for p in (layer.weight, layer.bias)]
+    params = [p for layer in layers for p in (layer.weight, layer.bias)] + list(extra_params)
     saved = [None if p.grad is None else p.grad.clone() for p in params]
     hidden_grad = model.hidden_grad
 
-    dfa.reset()
+    rule.reset()
     model.hidden_grad = True
     for p in params:
         p.grad = None
@@ -293,7 +301,7 @@ def dfa_alignment(model, dfa, layers, x, y) -> list[float]:
     F.cross_entropy(logits, y).backward()
     true = [torch.cat([layer.weight.grad.flatten(), layer.bias.grad.flatten()])
             for layer in layers]
-    dfa.modulate(logits.detach().softmax(1) - F.one_hot(y, logits.shape[1]))
+    deliver(logits.detach(), y)
     est = [torch.cat([layer.weight.grad.flatten(), layer.bias.grad.flatten()])
            for layer in layers]
     cos = [F.cosine_similarity(a, b, dim=0).item() for a, b in zip(true, est)]
@@ -324,17 +332,28 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
 
     # The readout is always trained by backprop.
     opts = [make_optimizer(model.fc.parameters(), args.opt, args.lr, args.wd, args.momentum)]
-    dfa = None
+    rule = deliver = None
     if method == "gd":
         opts.append(make_optimizer(hidden_params, args.opt, args.lr, args.wd, args.momentum))
     elif method == "dfa":
         model.hidden_grad = False
-        dfa = DirectFeedback(layers, n_out=10, posts=[post for _, post in hidden])
-        dfa.load_state_dict({"feedback": feedback_matrices(
+        rule = DirectFeedback(layers, n_out=10, posts=[post for _, post in hidden])
+        rule.load_state_dict({"feedback": feedback_matrices(
             model, hidden, 10, args.dfa_scale, args.share_shortcut_feedback,
             args.dfa_feedback == "tied", torch.Generator().manual_seed(seed), device)})
+        # Output error e = softmax - one-hot, i.e. dLoss/dlogits per sample.
+        deliver = lambda logits, yb: rule.modulate(logits.softmax(1) - F.one_hot(yb, 10))
         opts.append(make_optimizer(hidden_params, args.dfa_opt, args.dfa_lr, args.dfa_wd,
                                    args.momentum))
+    elif method == "local":
+        model.hidden_grad = False
+        rule = LocalLoss(layers, 10, posts=[post for _, post in hidden],
+                         shapes=output_shapes(model, layers, device), loss=args.local_loss,
+                         beta=args.local_beta, dim_in_decoder=args.local_dim_in_decoder)
+        deliver = lambda logits, yb: rule.modulate(yb)
+        # The heads are trained alongside the layers they serve.
+        opts.append(make_optimizer(hidden_params + list(rule.parameters()), args.local_opt,
+                                   args.local_lr, args.local_wd, args.momentum))
     else:  # frozen: the hidden parameters are in no optimizer
         model.hidden_grad = False
 
@@ -365,9 +384,8 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
             for opt in opts:
                 opt.zero_grad(set_to_none=True)
             loss.backward()  # the readout (and, for gd, every layer)
-            if dfa is not None:
-                # Output error e = softmax - one-hot, i.e. dLoss/dlogits per sample.
-                dfa.modulate(logits.detach().softmax(1) - F.one_hot(yb, 10))
+            if rule is not None:
+                deliver(logits.detach(), yb)
             for opt in opts:
                 opt.step()
             for sched in schedulers:
@@ -386,9 +404,10 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
         history["test"].append(test_acc)
         history["loss"].append(loss_sum / seen)
         align = ""
-        if dfa is not None and args.align_every and (epoch % args.align_every == 0
-                                                     or epoch == args.epochs):
-            cos = dfa_alignment(model, dfa, layers, x_probe, y_probe)
+        if rule is not None and args.align_every and (epoch % args.align_every == 0
+                                                      or epoch == args.epochs):
+            extra = list(rule.parameters()) if method == "local" else []
+            cos = alignment(model, rule, deliver, layers, x_probe, y_probe, extra)
             history["align"].append((epoch, cos))
             align = f"  align {statistics.fmean(cos):+.3f}"
         if args.progress:
@@ -397,12 +416,22 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
               f"test {test_acc:6.2f}%{align}  ({time.time() - t0:.0f}s)", flush=True)
 
     history["time"] = time.time() - t_run
-    if dfa is not None:
-        dfa.remove()
+    if rule is not None:
+        rule.remove()
     return history
 
 
 # -- reporting ---------------------------------------------------------------
+
+
+def final_alignment(results) -> dict[str, list[float]]:
+    """Per method, the final-epoch alignment per layer, mean over seeds."""
+    out = {}
+    for method, runs in results.items():
+        last = [run["align"][-1][1] for run in runs if run["align"]]
+        if last:
+            out[method] = [statistics.fmean(c) for c in zip(*last)]
+    return out
 
 
 def plot(results, args, path: str):
@@ -412,8 +441,9 @@ def plot(results, args, path: str):
     import matplotlib.pyplot as plt
 
     ink, muted, grid, surface = "#0b0b0b", "#898781", "#e1e0d9", "#fcfcfb"
-    style = {"gd": ("#2a78d6", "o"), "dfa": ("#7b5ce0", "P"), "frozen": ("#008300", "X")}
-    aligns = [run["align"][-1][1] for run in results.get("dfa", []) if run["align"]]
+    style = {"gd": ("#2a78d6", "o"), "dfa": ("#7b5ce0", "P"), "local": ("#d9622b", "D"),
+             "frozen": ("#008300", "X")}
+    aligns = final_alignment(results)
 
     ncols = 2 if aligns else 1
     fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 4.5), dpi=150,
@@ -451,17 +481,18 @@ def plot(results, args, path: str):
          f"CIFAR-10, {getattr(args, 'arch_label', args.arch)}" +(f" (mean ± s.d., {seeds} seeds)" if seeds > 1 else ""))
     ax.legend(frameon=False, loc="lower right", labelcolor=ink)
 
-    # Right: final DFA/backprop alignment per layer, input to output.
+    # Right: final alignment with backprop per layer, input to output.
     if aligns:
         ax = axes[1]
-        per_layer = list(zip(*aligns))
-        mean = [statistics.fmean(c) for c in per_layer]
-        idx = range(len(mean))
         ax.axhline(0, color="#c3c2b7", lw=1)
-        ax.plot(idx, mean, color=style["dfa"][0], marker=style["dfa"][1], lw=2, ms=6,
-                markeredgecolor=surface, markeredgewidth=1)
-        tidy(ax, "Hidden layer (stem → last block)", "cos(DFA update, gradient)",
-             "DFA alignment with backprop, final epoch")
+        for method, mean in aligns.items():
+            color, marker = style[method]
+            ax.plot(range(len(mean)), mean, color=color, marker=marker, lw=2, ms=6,
+                    markeredgecolor=surface, markeredgewidth=1, label=LABELS[method])
+        tidy(ax, "Hidden layer (input → output)", "cos(update, gradient)",
+             "Alignment with backprop, final epoch")
+        if len(aligns) > 1:
+            ax.legend(frameon=False, labelcolor=ink)
 
     fig.tight_layout()
     fig.savefig(path, facecolor=surface)
@@ -501,8 +532,22 @@ def add_args(p: argparse.ArgumentParser, archs, default_arch: str):
     p.add_argument("--share-shortcut-feedback", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="one feedback matrix for a block's conv2 and its projection shortcut")
+    # Local error signals: the hidden layers and their auxiliary heads.
+    p.add_argument("--local-loss", choices=("pred", "sim", "predsim"), default="predsim",
+                   help="local loss: pred (classifier), sim (similarity matching) or "
+                        "predsim (both, weighted by --local-beta)")
+    p.add_argument("--local-beta", type=float, default=0.99,
+                   help="weight of the sim term in predsim")
+    p.add_argument("--local-dim-in-decoder", type=int, default=4096,
+                   help="max input size of each pred head (conv activity is avg-pooled)")
+    p.add_argument("--local-opt", choices=("sgd", "adam"), default="adam",
+                   help="optimizer for local hidden layers and heads")
+    p.add_argument("--local-lr", type=float, default=5e-4,
+                   help="lr for local hidden layers and heads")
+    p.add_argument("--local-wd", type=float, default=0.0,
+                   help="weight decay for local hidden layers and heads")
     p.add_argument("--align-every", type=int, default=5,
-                   help="epochs between DFA/backprop alignment probes (0: off)")
+                   help="epochs between dfa/local alignment probes with backprop (0: off)")
     p.add_argument("--schedule", choices=("constant", "cosine", "step"), default="cosine",
                    help="lr schedule, applied to every optimizer")
     p.add_argument("--warmup-epochs", type=int, default=1, help="linear lr warmup")
@@ -544,10 +589,9 @@ def run(args, build_model):
               f"{statistics.fmean(r['test'][-1] for r in runs):8.2f} "
               f"{statistics.fmean(max(r['test']) for r in runs):10.2f}")
 
-    aligns = [r["align"][-1][1] for r in results.get("dfa", []) if r["align"]]
-    if aligns:
-        print("\nDFA alignment with the backprop gradient, final epoch (cosine per layer)")
-        print("  " + " ".join(f"{statistics.fmean(c):+.2f}" for c in zip(*aligns)))
+    for method, mean in final_alignment(results).items():
+        print(f"\n{method} alignment with the backprop gradient, final epoch (cosine per layer)")
+        print("  " + " ".join(f"{c:+.2f}" for c in mean))
 
     if args.json:
         with open(args.json, "w") as f:

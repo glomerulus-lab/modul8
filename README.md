@@ -37,7 +37,7 @@ pip install /path/to/modul8         # or from a local clone
 pip install -e /path/to/modul8      # editable, to work on modul8 itself
 ```
 
-Then `from modul8 import ThreeFactor, DirectFeedback`.
+Then `from modul8 import ThreeFactor, DirectFeedback, LocalLoss`.
 
 The `cpu`, `cu124` and `cu134` extras only choose a PyTorch index when working
 inside this repository with uv (see [Develop](#develop)). Elsewhere they just
@@ -244,6 +244,73 @@ Practical notes:
 - `paused()`, `reset()`, `enable()` and `remove()` work as for `ThreeFactor`;
   `DirectFeedback` is also a context manager.
 
+### Local error signals: `LocalLoss`
+
+Instead of an error from the network's output, each layer can learn from a
+loss of its own (Nøkland & Eidnes, *Training Neural Networks with Local Error
+Signals*, 2019). A small auxiliary head reads the layer's activity `h` and
+computes a local loss `L(h, y)` from the labels; the layer's per-neuron error
+is that loss's gradient with respect to its own activity:
+
+```
+Δw_ij = −lr · (∂L/∂h)_i · f'(a_i) · pre_j
+```
+
+This is DFA's three-factor rule with `∂L/∂h` in place of `Bᵀe`. No error
+crosses from one layer to another: each layer gets exactly the backprop
+gradient of its own local loss, and nothing else.
+
+```python
+from modul8 import LocalLoss
+
+local = LocalLoss(
+    [model.conv1, model.fc1],
+    n_classes=10,
+    posts=[model.relu1, model.relu2],   # the loss reads each ReLU's output
+    shapes=[(16, 26, 26), (128,)],      # per-sample activity shapes: builds the heads now
+)
+opt = torch.optim.Adam([*model.parameters(), *local.parameters()], lr=5e-4)
+
+logits = model(x)
+loss = F.cross_entropy(logits, y)
+opt.zero_grad()
+loss.backward()                         # backprop for the readout
+local.modulate(y)                       # labels, not an error
+opt.step()
+```
+
+The default heads (`LocalHead`) follow the paper's code
+([anokland/local-loss](https://github.com/anokland/local-loss)):
+
+| `loss` | head |
+| --- | --- |
+| `"pred"` | average-pool conv activity down to at most `dim_in_decoder` (4096) features, then a linear classifier (weights initialised to zero); cross-entropy. |
+| `"sim"` | a bias-free 3×3 conv (conv layers) or linear map (linear layers), then the batch's cosine-similarity matrix (each channel summarised by its spatial s.d.), matched by MSE to the similarity matrix of the one-hot labels. |
+| `"predsim"` (default) | `(1 − beta) · pred + beta · sim`, `beta = 0.99`. |
+
+| option | meaning |
+| --- | --- |
+| `posts` | per layer, the module whose output the loss reads and `derivative` is applied to (usually the nonlinearity). Layers that share a post (a conv and its projection shortcut) share one head and one error. |
+| `heads` | your own heads instead, one per distinct post: modules with `forward(h, y) -> scalar loss`. |
+| `shapes` | per-layer activity shapes, so the default heads exist before training. Without it they are built on the first `modulate()` (or by `build(shapes)`). |
+| `loss`, `beta`, `dim_in_decoder`, `similarity_std` | head options, as above. |
+| `derivative`, `bias` | as for `DirectFeedback`. |
+
+Practical notes:
+
+- **Add `local.parameters()` to an optimizer.** The heads learn by ordinary
+  gradient descent on the local loss. `modulate()` accumulates their gradients
+  into `.grad`, so zero them with the rest.
+- The loss reads the post module's output (here, before batch norm, dropout
+  and pooling), so that `f'` is the exact local derivative. The paper's loss
+  reads the block's output after BN and the nonlinearity.
+- Each `modulate()` needs exactly one captured forward pass (the batch the
+  labels belong to); the per-layer work is one small autograd pass through a
+  head, done one layer at a time.
+- `local.last_losses` holds each head's loss from the last `modulate()`.
+- `state_dict()` / `load_state_dict()` save the heads; `paused()`, `reset()`,
+  `enable()` and `remove()` work as for `ThreeFactor`.
+
 ### Behaviour to know
 
 - Activity is captured on every forward pass while the layer is in **training
@@ -300,11 +367,12 @@ uv run --group examples python examples/mnist_learning_curve.py --dataset fmnist
     --sizes 60000 --seeds 3 --methods gd frozen np dfa --batch-size 128 --steps 30000
 ```
 
-## Example: DFA on CIFAR-10 ResNets
+## Example: DFA and local losses on CIFAR-10 ResNets
 
 `examples/cifar10_resnet_dfa.py` trains a CIFAR-style ResNet (`--arch`
 `resnet20/32/44/56/110` or `resnet18/34`) on CIFAR-10 with backprop (`gd`),
-DFA (`dfa`) and a frozen-random control (`frozen`). Every conv, including the
+DFA (`dfa`), local error signals (`local`) and a frozen-random control
+(`frozen`). Every conv, including the
 stem and the 1x1 projection shortcuts, is trained the method's way; the linear
 readout is always trained by backprop.
 
@@ -315,18 +383,22 @@ uv run --group examples python examples/cifar10_resnet_dfa.py --arch resnet20
 Each block is `BN(ReLU(conv1(x)))`, then `BN(ReLU(conv2(h) + shortcut(x)))`,
 with `affine=False` batch norm after the ReLU as in the MNIST example. A
 block's conv2 and projection shortcut feed the same units, so they share one
-feedback matrix (`--no-share-shortcut-feedback` gives each its own). For
-`dfa` and `frozen` the hidden layers run without autograd, so no backward pass
-goes through the network. Every `--align-every` epochs the script reports the
-cosine between each layer's DFA update and its true gradient, and the plot
+feedback matrix (`--no-share-shortcut-feedback` gives each its own), and
+for `local` one head. For `dfa`, `local` and `frozen` the hidden layers run
+without autograd, so no backward pass goes through the network. Every
+`--align-every` epochs the script reports the cosine between each layer's DFA
+or local update and its true gradient, and the plot
 shows this alignment per layer next to the accuracy curves. Default
 hyperparameters: SGD (lr 0.1, Nesterov momentum, wd 5e-4) for backprop
 weights, Adam (lr 1e-3) for DFA, cosine schedule with 1 warmup epoch, standard
-crop + flip augmentation. The DFA settings have not been tuned.
+crop + flip augmentation. The DFA settings have not been tuned. `local`
+defaults to the paper's `predsim` loss (`--local-loss`, `--local-beta`) with
+Adam lr 5e-4 for the layers and their heads (`--local-opt`, `--local-lr`,
+`--local-wd`); these are also untuned here.
 `--dfa-feedback tied` draws each conv's feedback per channel and shares it
 across spatial positions instead of drawing one value per unit.
 
-## Example: DFA on CIFAR-10 VGG nets
+## Example: DFA and local losses on CIFAR-10 VGG nets
 
 `examples/cifar10_vgg_dfa.py` runs the same comparison on the VGG variants of
 Nøkland & Eidnes (2019), including their widened versions (`--feat-mult`):
@@ -340,7 +412,9 @@ The convs are followed by one hidden fully connected layer (`--num-hidden`,
 default 1024), then the backprop-trained readout. Layers are conv → ReLU → BN
 (`affine=False`), as in the other examples, rather than the paper's
 conv → BN → leaky ReLU. `--dropout` adds dropout after each hidden layer. The
-paper's recipes use 0.2 for vgg8b and 0.3 for vgg11b (3x).
+paper's recipes use 0.2 for vgg8b and 0.3 for vgg11b (3x). The paper's own
+method is `--methods local`; its loss reads each layer's ReLU output, before
+the BN.
 
 Results for vgg8 (full training set, 80 epochs, tied feedback, SGD lr 0.01 for
 backprop weights, Adam lr 0.01 with weight decay 1e-5 for DFA, other options at
