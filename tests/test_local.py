@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from modul8 import LocalHead, LocalLoss, similarity_matrix
+from modul8 import LinearFA, LocalHead, LocalLoss, similarity_matrix
 
 
 def _reference(layer, relu, head, x, y):
@@ -193,3 +193,109 @@ def test_dead_units_give_finite_grads():
     head(h, torch.tensor([0, 1, 2, 0])).backward()
     assert torch.isfinite(h.grad).all()
     assert all(torch.isfinite(p.grad).all() for p in head.parameters())
+
+
+# -- bio variant ----------------------------------------------------------------
+
+def test_linear_fa_gradients():
+    torch.manual_seed(0)
+    fa = LinearFA(5, 3)
+    x = torch.randn(4, 5, requires_grad=True)
+    out = fa(x)
+    assert torch.allclose(out, F.linear(x, fa.weight, fa.bias))
+    g = torch.randn(4, 3)
+    out.backward(g)
+    assert torch.allclose(x.grad, g @ fa.feedback)          # B, not W
+    assert torch.allclose(fa.weight.grad, g.t() @ x.detach())
+    assert torch.allclose(fa.bias.grad, g.sum(0))
+    assert [n for n, _ in fa.named_parameters()] == ["weight", "bias"]
+
+
+def test_linear_fa_with_feedback_equal_to_weight_is_backprop():
+    torch.manual_seed(0)
+    fa = LinearFA(5, 3)
+    fa.feedback.copy_(fa.weight.detach())
+    x = torch.randn(4, 5, requires_grad=True)
+    (fa(x) ** 2).sum().backward()
+    x2 = x.detach().clone().requires_grad_()
+    (F.linear(x2, fa.weight, fa.bias) ** 2).sum().backward()
+    assert torch.allclose(x.grad, x2.grad, atol=1e-6)
+
+
+@pytest.mark.parametrize("loss", ["pred", "sim", "predsim"])
+@pytest.mark.parametrize("kind", ["linear", "conv"])
+def test_bio_update_is_local_loss_gradient(loss, kind):
+    torch.manual_seed(0)
+    if kind == "linear":
+        layer, x, shape = nn.Linear(7, 6), torch.randn(9, 7), (6,)
+    else:
+        layer, x, shape = nn.Conv2d(3, 8, 3, padding=1), torch.randn(9, 3, 8, 8), (8, 8, 8)
+    relu = nn.ReLU()
+    y = torch.randint(0, 4, (9,))
+    local = LocalLoss(layer, 4, posts=[relu], shapes=[shape], loss=loss, bio=True,
+                      target_proj_size=16, dim_in_decoder=128, beta=0.5)
+    head = local.heads[0]
+    for p in head.parameters():
+        nn.init.normal_(p, std=0.3)
+    with local.paused():
+        want = _reference(layer, relu, head, x, y)
+    with torch.no_grad():
+        relu(layer(x))
+    local.modulate(y)
+    got = [layer.weight.grad, layer.bias.grad, *(p.grad for p in head.parameters())]
+    assert layer.weight.grad.abs().sum() > 0
+    for g, w in zip(got, want):
+        assert torch.allclose(g, w, atol=1e-5, rtol=1e-4)
+
+
+def test_bio_heads_structure():
+    conv = LocalHead((128, 32, 32), 10, loss="predsim", bio=True)
+    assert conv.pool is not None and conv.decoder.in_features <= 4096
+    assert isinstance(conv.decoder, LinearFA) and conv.decoder.out_features == 128
+    assert not hasattr(conv, "sim_proj")
+    assert torch.count_nonzero(conv.decoder.weight) == 0      # zero init, as in the reference
+    assert torch.count_nonzero(conv.decoder.feedback) > 0
+    sim = LocalHead((16, 8, 8), 10, loss="sim", bio=True, dim_in_decoder=256)
+    assert sim.pool is not None                              # pooled for sim too
+    assert list(sim.parameters()) == []                      # nothing to learn
+    assert {n for n, _ in conv.named_buffers()} == {"proj_y", "decoder.feedback"}
+
+
+def test_bio_pred_error_nonzero_at_zero_init():
+    torch.manual_seed(0)
+    layer, relu = nn.Linear(5, 6), nn.ReLU()
+    local = LocalLoss(layer, 3, posts=[relu], shapes=[(6,)], loss="pred", bio=True)
+    relu(layer(torch.randn(8, 5)))
+    local.modulate(torch.randint(0, 3, (8,)))
+    assert layer.weight.grad.abs().sum() > 0  # flows through B, not the zero W
+
+
+def test_bio_fixed_matrices_do_not_train_and_are_reproducible():
+    def make(seed):
+        return LocalLoss(nn.Linear(5, 6), 3, posts=[nn.ReLU()], shapes=[(6,)], bio=True,
+                         generator=torch.Generator().manual_seed(seed))
+
+    a, b = make(1), make(1)
+    for name in ("proj_y", "decoder.feedback"):
+        ta = a.heads[0].get_buffer(name)
+        assert torch.equal(ta, b.heads[0].get_buffer(name))
+        assert not torch.equal(ta, make(2).heads[0].get_buffer(name))
+
+    head = a.heads[0]
+    before = {n: t.clone() for n, t in head.named_buffers()}
+    opt = torch.optim.SGD(list(a.parameters()), lr=1.0)
+    lin, relu = a.layers[0], nn.ReLU()
+    a.remove()
+    a = LocalLoss(lin, 3, posts=[relu], heads=[head])
+    for _ in range(3):
+        opt.zero_grad()
+        relu(lin(torch.randn(8, 5)))
+        a.modulate(torch.randint(0, 3, (8,)))
+        opt.step()
+    for n, t in head.named_buffers():
+        assert torch.equal(t, before[n])
+
+    c = make(3)
+    c.load_state_dict(a.state_dict())
+    for n, t in head.named_buffers():
+        assert torch.equal(c.heads[0].get_buffer(n), t)

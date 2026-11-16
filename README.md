@@ -311,6 +311,32 @@ Practical notes:
 - `state_dict()` / `load_state_dict()` save the heads; `paused()`, `reset()`,
   `enable()` and `remove()` work as for `ThreeFactor`.
 
+#### The bio variant: `bio=True`
+
+In the default heads, a layer's error passes through learned weights it does
+not own (the sim conv, the pred classifier's `Wᵀ`). `bio=True` gives the
+reference code's "more biologically plausible" heads (its `--bio` flag), where
+it does not:
+
+- **Targets:** the labels become a fixed random projection `P·onehot`
+  (`target_proj_size`, default 128). `P` is drawn once and never trained.
+- **pred:** pooled activity → `LinearFA` → binary cross-entropy against
+  `(P·onehot > 0)`. `LinearFA` learns its weights by their true gradient but
+  sends the error back to the layer through a fixed random matrix `B` instead
+  of `Wᵀ` (feedback alignment).
+- **sim:** the similarity matrix of the average-pooled activity itself (no
+  learned conv), matched to the similarity matrix of `P·onehot`.
+
+```python
+local = LocalLoss(layers, 10, posts=posts, shapes=shapes, bio=True, beta=0.01,
+                  generator=torch.Generator().manual_seed(0))
+```
+
+The heads are far cheaper: a pool, one small linear map and some batch × batch
+matrices per layer. The reference code's bio recipes use `beta=0.01` for
+`predsim` (mostly pred), not the default 0.99. `P` and `B` are buffers: seed
+`generator` for reproducibility, and they are saved by `state_dict()`.
+
 ### Behaviour to know
 
 - Activity is captured on every forward pass while the layer is in **training
@@ -371,8 +397,8 @@ uv run --group examples python examples/mnist_learning_curve.py --dataset fmnist
 
 `examples/cifar10_resnet.py` trains a CIFAR-style ResNet (`--arch`
 `resnet20/32/44/56/110` or `resnet18/34`) on CIFAR-10 with backprop (`gd`),
-DFA (`dfa`), local error signals (`local`) and a frozen-random control
-(`frozen`). Every conv, including the
+DFA (`dfa`), local error signals (`local`), their bio variant (`local-bio`)
+and a frozen-random control (`frozen`). Every conv, including the
 stem and the 1x1 projection shortcuts, is trained the method's way; the linear
 readout is always trained by backprop.
 
@@ -394,7 +420,11 @@ weights, Adam (lr 1e-3) for DFA, cosine schedule with 1 warmup epoch, standard
 crop + flip augmentation. The DFA settings have not been tuned. `local`
 defaults to the paper's `predsim` loss (`--local-loss`, `--local-beta`) with
 Adam lr 5e-4 for the layers and their heads (`--local-opt`, `--local-lr`,
-`--local-wd`); these are also untuned here.
+`--local-wd`); these are also untuned here. `local-bio` shares those
+settings, except that its predsim weight is `--local-bio-beta` (default 0.01,
+as in the reference code's bio recipes). For both, as in the reference code,
+the readout starts at zero (`--no-local-readout-zero-init` to turn off) and,
+for `predsim`, its loss is scaled by `1 − beta` (`--local-readout-scale`).
 `--dfa-feedback tied` draws each conv's feedback per channel and shares it
 across spatial positions instead of drawing one value per unit.
 

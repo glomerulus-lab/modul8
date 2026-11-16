@@ -22,6 +22,22 @@ Local Error Signals" (github.com/anokland/local-loss):
              then the similarity matrix of the batch, matched (MSE) to the
              similarity matrix of the one-hot labels.
     predsim  (1 - beta) * pred + beta * sim, beta = 0.99 by default.
+
+With ``bio=True`` the heads are the reference code's "more biologically
+plausible" (``--bio``) versions, in which no error depends on a learned
+weight the layer does not own:
+
+    * the labels are replaced by a fixed random projection ``P y_onehot``
+      (``target_proj_size`` = 128 dimensions);
+    * pred: average-pooled activity -> :class:`LinearFA` -> binary
+      cross-entropy against ``(P y_onehot > 0)``. ``LinearFA`` learns its
+      weights by their true gradient but sends the error back to ``h``
+      through a fixed random matrix (feedback alignment);
+    * sim: the similarity matrix of the average-pooled activity itself (no
+      learned conv), matched to the similarity matrix of ``P y_onehot``.
+
+The reference code's bio recipes use ``beta = 0.01`` for predsim (mostly
+pred), not the default 0.99.
 """
 
 from __future__ import annotations
@@ -79,6 +95,52 @@ def _decoder_pool(c: int, h: int, w: int, max_dim: int) -> Optional[nn.AvgPool2d
     return nn.AvgPool2d((ks_h, ks_w), padding=(pad_h, pad_w))
 
 
+class _LinearFAFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, feedback):
+        ctx.save_for_backward(x, weight, feedback)
+        ctx.has_bias = bias is not None
+        out = x @ weight.t()
+        return out if bias is None else out + bias
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, weight, feedback = ctx.saved_tensors
+        # The error to the input goes through the fixed feedback matrix, not
+        # weight^T; weight and bias get their true gradients.
+        gx = grad @ feedback if ctx.needs_input_grad[0] else None
+        gw = grad.t() @ x if ctx.needs_input_grad[1] else None
+        gb = grad.sum(0) if ctx.has_bias and ctx.needs_input_grad[2] else None
+        return gx, gw, gb, None
+
+
+class LinearFA(nn.Module):
+    """Linear layer trained by feedback alignment: the forward pass is
+    ``x W^T + b`` and W, b get their true gradients, but the gradient passed
+    back to ``x`` is ``grad @ B`` for a fixed random ``B`` (a buffer, same
+    shape as W) instead of ``grad @ W``. Input must be 2-D.
+
+    W and B are drawn from U(-1/sqrt(in), 1/sqrt(in)); the bias starts at 0.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 generator: Optional[torch.Generator] = None):
+        super().__init__()
+        self.in_features, self.out_features = in_features, out_features
+        bound = 1 / math.sqrt(in_features)
+
+        def uniform():
+            u = torch.rand(out_features, in_features, generator=generator)
+            return (2 * u - 1) * bound
+
+        self.weight = nn.Parameter(uniform())
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.register_buffer("feedback", uniform())
+
+    def forward(self, x: Tensor) -> Tensor:
+        return _LinearFAFunction.apply(x, self.weight, self.bias, self.feedback)
+
+
 class LocalHead(nn.Module):
     """The default local loss for one layer: ``forward(h, y)`` returns the
     scalar loss for activity ``h`` and integer labels ``y``.
@@ -93,11 +155,19 @@ class LocalHead(nn.Module):
             activity is average-pooled down to it.
         similarity_std: summarise each feature-map channel by its spatial
             standard deviation in :func:`similarity_matrix`.
+        bio: use the reference code's biologically plausible heads (see the
+            module docstring): random label projection, pooled activity for
+            sim, and a feedback-alignment pred classifier with a BCE loss.
+        target_proj_size: size of the random label projection when ``bio``.
+        generator: ``torch.Generator`` for the fixed random matrices of the
+            bio heads (the label projection and the feedback matrix).
     """
 
     def __init__(self, shape: Sequence[int], n_classes: int, loss: str = "predsim",
                  beta: float = 0.99, dim_in_decoder: int = 4096,
-                 similarity_std: bool = True):
+                 similarity_std: bool = True, bio: bool = False,
+                 target_proj_size: int = 128,
+                 generator: Optional[torch.Generator] = None):
         super().__init__()
         shape = tuple(int(s) for s in shape)
         if len(shape) not in (1, 3):
@@ -111,32 +181,54 @@ class LocalHead(nn.Module):
         self.beta = float(beta)
         self.n_classes = n_classes
         self.similarity_std = similarity_std
+        self.bio = bio
         conv = len(shape) == 3
+        pred = loss in ("pred", "predsim")
+        sim = loss in ("sim", "predsim")
 
-        if loss in ("sim", "predsim"):
+        # bio: sim reads the pooled activity too, so the pool is always built.
+        self.pool = (_decoder_pool(*shape, dim_in_decoder) if conv and (pred or bio)
+                     else None)
+        if bio:
+            # A fixed random projection of the one-hot labels, with
+            # nn.Linear's default init, U(-1/sqrt(n_classes), 1/sqrt(n_classes)).
+            u = torch.rand(target_proj_size, n_classes, generator=generator)
+            self.register_buffer("proj_y", (2 * u - 1) / math.sqrt(n_classes))
+        elif sim:
             c = shape[0]
             self.sim_proj = (nn.Conv2d(c, c, 3, 1, 1, bias=False) if conv
                              else nn.Linear(c, c, bias=False))
-        if loss in ("pred", "predsim"):
-            self.pool = _decoder_pool(*shape, dim_in_decoder) if conv else None
+        if pred:
             if self.pool is None:
                 n_in = math.prod(shape)
             else:
                 n_in = self.pool(torch.zeros(1, *shape)).numel()
-            self.decoder = nn.Linear(n_in, n_classes)
+            self.decoder = (LinearFA(n_in, target_proj_size, generator=generator) if bio
+                            else nn.Linear(n_in, n_classes))
             nn.init.zeros_(self.decoder.weight)
 
     def forward(self, h: Tensor, y: Tensor) -> Tensor:
         pred_w, sim_w = {"pred": (1.0, 0.0), "sim": (0.0, 1.0),
                          "predsim": (1 - self.beta, self.beta)}[self.loss]
         total = h.new_zeros(())
+        onehot = F.one_hot(y, self.n_classes).to(h.dtype)
+        z = h if self.pool is None else self.pool(h)
+        if self.bio:
+            target = onehot @ self.proj_y.t()
         if pred_w:
-            z = h if self.pool is None else self.pool(h)
-            total = total + pred_w * F.cross_entropy(self.decoder(z.flatten(1)), y)
+            logits = self.decoder(z.flatten(1))
+            if self.bio:
+                pred = F.binary_cross_entropy_with_logits(logits, (target > 0).to(h.dtype))
+            else:
+                pred = F.cross_entropy(logits, y)
+            total = total + pred_w * pred
         if sim_w:
-            rh = similarity_matrix(self.sim_proj(h), self.similarity_std)
-            ry = similarity_matrix(F.one_hot(y, self.n_classes).to(h.dtype),
-                                   self.similarity_std)
+            if self.bio:
+                rh = similarity_matrix(z, self.similarity_std)
+                ry = similarity_matrix(target, self.similarity_std)
+            else:
+                rh = similarity_matrix(self.sim_proj(h), self.similarity_std)
+                ry = similarity_matrix(onehot, self.similarity_std)
             total = total + sim_w * F.mse_loss(rh, ry)
         return total
 
@@ -159,8 +251,9 @@ class LocalLoss:
         shapes: per-layer activity shapes (without the batch dimension), to
             build the default heads now so :meth:`parameters` can go to an
             optimizer before training.
-        loss, beta, dim_in_decoder, similarity_std: passed to
-            :class:`LocalHead`.
+        loss, beta, dim_in_decoder, similarity_std, bio, target_proj_size,
+        generator: passed to :class:`LocalHead` (``generator`` draws the bio
+            heads' fixed random matrices, one head after another).
         derivative: maps the post activity to ``f'(a)``. Default
             :func:`relu_derivative`; ``None`` means linear units.
         bias: also train the biases. Default ``True``.
@@ -197,6 +290,9 @@ class LocalLoss:
         beta: float = 0.99,
         dim_in_decoder: int = 4096,
         similarity_std: bool = True,
+        bio: bool = False,
+        target_proj_size: int = 128,
+        generator: Optional[torch.Generator] = None,
         derivative: Optional[Callable[[Tensor], Tensor]] = relu_derivative,
         bias: bool = True,
     ):
@@ -220,7 +316,8 @@ class LocalLoss:
         self.layers = layers
         self.n_classes = n_classes
         self.head_kwargs = dict(loss=loss, beta=beta, dim_in_decoder=dim_in_decoder,
-                                similarity_std=similarity_std)
+                                similarity_std=similarity_std, bio=bio,
+                                target_proj_size=target_proj_size, generator=generator)
 
         # Group layers by post module: one head and one error per group.
         index: dict[object, int] = {}

@@ -14,7 +14,15 @@ is always trained by backprop):
     local   layer-local error signals (Nøkland & Eidnes, 2019): each hidden
             layer's error is the gradient of a local loss computed by a small
             auxiliary head on its ReLU output (--local-loss pred, sim or
-            predsim); no error crosses between layers
+            predsim); no error crosses between layers. As in the reference
+            code, the readout starts at zero and its loss is scaled by
+            (1 - beta) for predsim (--local-readout-scale,
+            --local-readout-zero-init)
+    local-bio  the reference code's "bio" local losses: a fixed random label
+            projection as the target, sim on average-pooled activity (no
+            learned conv), and a pred classifier whose error reaches the
+            layer through a fixed random matrix (feedback alignment);
+            predsim weights default to the bio recipes' beta = 0.01
     frozen  hidden layers left at their random initialisation (control: a
             method must beat this to be learning useful features)
 
@@ -61,11 +69,12 @@ from torchvision import datasets
 
 from modul8 import DirectFeedback, LocalLoss
 
-METHODS = ("gd", "dfa", "local", "frozen")
+METHODS = ("gd", "dfa", "local", "local-bio", "frozen")
 LABELS = {
     "gd": "Backprop",
     "dfa": "Direct feedback alignment",
     "local": "Local error signals",
+    "local-bio": "Local error signals (bio)",
     "frozen": "Frozen random hidden",
 }
 
@@ -334,6 +343,7 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
     # The readout is always trained by backprop.
     opts = [make_optimizer(model.fc.parameters(), args.opt, args.lr, args.wd, args.momentum)]
     rule = deliver = None
+    readout_scale = 1.0  # multiplies the readout's loss before backward
     if method == "gd":
         opts.append(make_optimizer(hidden_params, args.opt, args.lr, args.wd, args.momentum))
     elif method == "dfa":
@@ -346,12 +356,24 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
         deliver = lambda logits, yb: rule.modulate(logits.softmax(1) - F.one_hot(yb, 10))
         opts.append(make_optimizer(hidden_params, args.dfa_opt, args.dfa_lr, args.dfa_wd,
                                    args.momentum))
-    elif method == "local":
+    elif method in ("local", "local-bio"):
         model.hidden_grad = False
+        bio = method == "local-bio"
+        beta = args.local_bio_beta if bio else args.local_beta
         rule = LocalLoss(layers, 10, posts=[post for _, post in hidden],
                          shapes=output_shapes(model, layers, device), loss=args.local_loss,
-                         beta=args.local_beta, dim_in_decoder=args.local_dim_in_decoder)
+                         beta=beta, dim_in_decoder=args.local_dim_in_decoder, bio=bio,
+                         target_proj_size=args.local_target_proj_size,
+                         generator=torch.Generator().manual_seed(seed))
         deliver = lambda logits, yb: rule.modulate(yb)
+        # As in the reference code: the readout starts at zero and, for
+        # predsim, its loss is scaled by (1 - beta).
+        if args.local_readout_zero_init:
+            nn.init.zeros_(model.fc.weight)
+        if args.local_readout_scale is not None:
+            readout_scale = args.local_readout_scale
+        elif args.local_loss == "predsim":
+            readout_scale = 1 - beta
         # The heads are trained alongside the layers they serve.
         opts.append(make_optimizer(hidden_params + list(rule.parameters()), args.local_opt,
                                    args.local_lr, args.local_wd, args.momentum))
@@ -384,7 +406,7 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
             loss = F.cross_entropy(logits, yb)
             for opt in opts:
                 opt.zero_grad(set_to_none=True)
-            loss.backward()  # the readout (and, for gd, every layer)
+            (readout_scale * loss).backward()  # the readout (and, for gd, every layer)
             if rule is not None:
                 deliver(logits.detach(), yb)
             for opt in opts:
@@ -407,7 +429,7 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
         align = ""
         if rule is not None and args.align_every and (epoch % args.align_every == 0
                                                       or epoch == args.epochs):
-            extra = list(rule.parameters()) if method == "local" else []
+            extra = list(rule.parameters()) if method.startswith("local") else []
             cos = alignment(model, rule, deliver, layers, x_probe, y_probe, extra)
             history["align"].append((epoch, cos))
             align = f"  align {statistics.fmean(cos):+.3f}"
@@ -466,6 +488,7 @@ def plot(results, args, path: str):
 
     ink, muted, grid, surface = "#0b0b0b", "#898781", "#e1e0d9", "#fcfcfb"
     style = {"gd": ("#2a78d6", "o"), "dfa": ("#7b5ce0", "P"), "local": ("#d9622b", "D"),
+             "local-bio": ("#b8336a", "v"),
              "frozen": ("#008300", "X")}
     aligns = final_alignment(results)
 
@@ -562,6 +585,16 @@ def add_args(p: argparse.ArgumentParser, archs, default_arch: str):
                         "predsim (both, weighted by --local-beta)")
     p.add_argument("--local-beta", type=float, default=0.99,
                    help="weight of the sim term in predsim")
+    p.add_argument("--local-bio-beta", type=float, default=0.01,
+                   help="weight of the sim term in predsim for local-bio (the reference "
+                        "code's bio recipes use 0.01)")
+    p.add_argument("--local-target-proj-size", type=int, default=128,
+                   help="size of local-bio's fixed random label projection")
+    p.add_argument("--local-readout-scale", type=float, default=None,
+                   help="scale of the readout's loss for local methods (default: 1 - beta "
+                        "for predsim, else 1, as in the reference code)")
+    p.add_argument("--local-readout-zero-init", action=argparse.BooleanOptionalAction,
+                   default=True, help="zero-initialise the readout for local methods")
     p.add_argument("--local-dim-in-decoder", type=int, default=4096,
                    help="max input size of each pred head (conv activity is avg-pooled)")
     p.add_argument("--local-opt", choices=("sgd", "adam"), default="adam",

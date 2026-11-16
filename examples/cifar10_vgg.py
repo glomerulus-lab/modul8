@@ -24,6 +24,7 @@ Differences from the paper's networks, to fit this repo's DFA convention:
     ReLU output, before the BN, dropout and pooling; the paper's reads the
     block's output after BN and the nonlinearity, before dropout. The heads
     themselves (pred, sim, predsim; --local-loss) follow the paper's code.
+    `local-bio` is the code's --bio variant (see examples/cifar10_resnet.py).
 
 The paper trains 400 epochs with Adam; the default here is a 30-epoch run.
 Its recipes use dropout 0.2 for vgg8b and 0.3 for vgg11b (3x) (--dropout).
