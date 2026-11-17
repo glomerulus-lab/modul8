@@ -8,7 +8,7 @@ comes one hidden fully connected layer (--num-hidden, 1024 by default, not
 scaled), then the linear readout.
 
 Methods, training loop, alignment probe and plot are those of
-examples/cifar10_resnet.py (see its docstring): every hidden layer -- each
+examples/cifar10_common.py (see its docstring): every hidden layer -- each
 conv and the hidden fc layer -- is trained by the method, and the readout is
 always trained by backprop.
 
@@ -24,7 +24,7 @@ Differences from the paper's networks, to fit this repo's DFA convention:
     ReLU output, before the BN, dropout and pooling; the paper's reads the
     block's output after BN and the nonlinearity, before dropout. The heads
     themselves (pred, sim, predsim; --local-loss) follow the paper's code.
-    `local-bio` is the code's --bio variant (see examples/cifar10_resnet.py).
+    `local-bio` is the code's --bio variant (see examples/cifar10_common.py).
 
 The paper trains 400 epochs with Adam; the default here is a 30-epoch run.
 Its recipes use dropout 0.2 for vgg8b and 0.3 for vgg11b (3x) (--dropout).
@@ -42,7 +42,7 @@ import argparse
 import torch
 from torch import nn
 
-from cifar10_resnet import add_args, norm, run
+from cifar10_common import add_args, norm, run
 
 # Nøkland & Eidnes's configurations: conv widths (before --feat-mult), "M" is
 # a 2x2 max-pool.

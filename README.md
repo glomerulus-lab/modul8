@@ -351,6 +351,15 @@ matrices per layer. The reference code's bio recipes use `beta=0.01` for
   unnecessary.
 - `hebb.remove()` detaches the hooks; `ThreeFactor` also works as a context
   manager.
+- **Other layers.** `ThreeFactor`, `DirectFeedback` and `LocalLoss` also accept
+  any module with parameters (a custom layer, a parametrized layer, a
+  transposed conv). Such a module is re-run on its captured input at
+  `modulate()` time, and each trainable parameter gets the vector-Jacobian
+  product of the output with `M · post`. For an `nn.Linear` / `nn.ConvNd` that
+  is exactly the closed-form update. The module's forward must be
+  deterministic and return one tensor. `mask`, `pre_fn` and `rule="oja"` are
+  not supported. Parameters named `bias` are trained only with `bias=True`.
+  With `reduce="all"`, dim 1 of the output is taken as the channel dim.
 
 ## Example: MNIST learning curves
 
@@ -405,6 +414,12 @@ readout is always trained by backprop.
 ```sh
 uv run --group examples python examples/cifar10_resnet.py --arch resnet20
 ```
+
+The CIFAR-10 scripts (this one, the VGG one below and
+`examples/orthogonal_filter.py`) each define only their model. Data loading,
+the methods, the training loop, the alignment probe, the CSV and plot, and the
+shared command-line options live in `examples/cifar10_common.py`, whose
+docstring also lists what a model must provide to plug in.
 
 Each block is `BN(ReLU(conv1(x)))`, then `BN(ReLU(conv2(h) + shortcut(x)))`,
 with `affine=False` batch norm after the ReLU as in the MNIST example. A

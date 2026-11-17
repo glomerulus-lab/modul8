@@ -299,3 +299,151 @@ def test_bio_fixed_matrices_do_not_train_and_are_reproducible():
     c.load_state_dict(a.state_dict())
     for n, t in head.named_buffers():
         assert torch.equal(c.heads[0].get_buffer(n), t)
+
+
+# -- layers other than Linear / Conv (autograd fallback) -------------------------
+
+
+class _Wrapped(nn.Module):
+    def __init__(self, layer):
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, x):
+        return self.layer(x)
+
+
+@pytest.mark.parametrize("bio", [False, True])
+def test_wrapped_conv_matches_plain_conv(bio):
+    """The autograd fallback gives LocalLoss the same layer and head updates
+    as the closed form on a plain nn.Conv2d."""
+    grads = []
+    for wrap in (False, True):
+        torch.manual_seed(0)
+        conv, relu = nn.Conv2d(3, 8, 3, padding=1), nn.ReLU()
+        layer = _Wrapped(conv) if wrap else conv
+        x, y = torch.randn(6, 3, 8, 8), torch.randint(0, 4, (6,))
+        local = LocalLoss(layer, 4, posts=[relu], shapes=[(8, 8, 8)], bio=bio,
+                          generator=torch.Generator().manual_seed(1))
+        relu(layer(x))
+        local.modulate(y)
+        grads.append([conv.weight.grad, conv.bias.grad,
+                      *(p.grad for p in local.parameters())])
+    for a, b in zip(*grads):
+        assert torch.allclose(a, b, atol=1e-6)
+
+
+class _OrthoProj(nn.Module):
+    """A conv-like layer with an orthogonally parametrized 1x1 channel map
+    behind a fixed expansion, as in examples/orthogonal_filter.py."""
+
+    def __init__(self, c_in, d, c_out):
+        super().__init__()
+        self.proj = nn.utils.parametrizations.orthogonal(nn.Linear(c_in, d, bias=False))
+        self.register_buffer("expand", torch.randn(c_out, d))
+        self.bias = nn.Parameter(torch.randn(c_out))
+
+    def forward(self, x):
+        z = F.conv2d(x, self.proj.weight[:, :, None, None])
+        return F.conv2d(z, self.expand[:, :, None, None], self.bias)
+
+
+def test_parametrized_layer_update_is_local_loss_gradient():
+    torch.manual_seed(0)
+    layer, relu = _OrthoProj(6, 3, 5), nn.ReLU()
+    head = LocalHead((5, 4, 4), 3)
+    x, y = torch.randn(8, 6, 4, 4), torch.randint(0, 3, (8,))
+    local = LocalLoss(layer, 3, posts=[relu], heads=[head])
+    relu(layer(x))
+    local.modulate(y)
+    params = [layer.proj.parametrizations.weight.original, layer.bias]
+    ref = torch.autograd.grad(head(relu(layer(x)), y), params)
+    for p, r in zip(params, ref):
+        assert p.grad is not None and torch.allclose(p.grad, r, atol=1e-6)
+
+
+# -- integration: LocalLoss inside a small network -------------------------------
+
+
+class _SmallNet(nn.Module):
+    """Two conv blocks (conv -> ReLU -> BN -> max-pool -> dropout), a hidden
+    linear layer and a readout, like the CIFAR VGG examples. With `custom`,
+    the second conv is an orthogonally parametrized layer, so LocalLoss uses
+    the autograd fallback for it."""
+
+    def __init__(self, custom: bool):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 6, 3, padding=1)
+        self.conv2 = _OrthoProj(6, 4, 8) if custom else nn.Conv2d(6, 8, 3, padding=1)
+        self.fc1 = nn.Linear(8 * 2 * 2, 10)
+        self.relus = nn.ModuleList(nn.ReLU() for _ in range(3))
+        self.bn1 = nn.BatchNorm2d(6, affine=False)
+        self.bn2 = nn.BatchNorm2d(8, affine=False)
+        self.drop = nn.Dropout(0.3)
+        self.readout = nn.Linear(10, 4)
+
+    def forward(self, x):
+        r1, r2, r3 = self.relus
+        x = self.drop(F.max_pool2d(self.bn1(r1(self.conv1(x))), 2))
+        x = self.drop(F.max_pool2d(self.bn2(r2(self.conv2(x))), 2))
+        x = self.drop(r3(self.fc1(x.flatten(1))))
+        return self.readout(x)
+
+    def hidden(self):
+        return [self.conv1, self.conv2, self.fc1], list(self.relus)
+
+
+def _detached_reference(model, layers, posts, heads, x, y):
+    """Gradients of the summed local losses, by autograd, with every hidden
+    layer's input detached so no error crosses between layers."""
+    acts = []
+    handles = [layer.register_forward_pre_hook(
+        lambda m, args: tuple(a.detach() for a in args)) for layer in layers]
+    handles += [post.register_forward_hook(lambda m, i, o: acts.append(o)) for post in posts]
+    try:
+        model(x)
+    finally:
+        for h in handles:
+            h.remove()
+    loss = sum(head(h, y) for head, h in zip(heads, acts))
+    params = ([p for layer in layers for p in layer.parameters()]
+              + [p for head in heads for p in head.parameters()])
+    return torch.autograd.grad(loss, params)
+
+
+@pytest.mark.parametrize("custom", [False, True], ids=["plain", "fallback"])
+@pytest.mark.parametrize("bio", [False, True], ids=["std", "bio"])
+def test_network_updates_match_detached_autograd(custom, bio):
+    """In a full network (BN, pooling, dropout and a flatten between the
+    layers, hidden layers run without autograd), every layer's and head's
+    LocalLoss update equals the gradient of its own local loss."""
+    import copy
+
+    torch.manual_seed(0)
+    model = _SmallNet(custom).train()
+    layers, posts = model.hidden()
+    local = LocalLoss(layers, 4, posts=posts, shapes=[(6, 8, 8), (8, 4, 4), (10,)],
+                      loss="predsim", beta=0.5, bio=bio, dim_in_decoder=64,
+                      generator=torch.Generator().manual_seed(1))
+    # The pred decoders start at zero; perturb every head so no term is trivial.
+    with torch.no_grad():
+        for p in local.parameters():
+            p.normal_(std=0.3)
+    ref_model, ref_heads = copy.deepcopy(model), copy.deepcopy(local.heads)
+    x, y = torch.randn(10, 3, 8, 8), torch.randint(0, 4, (10,))
+
+    torch.manual_seed(2)  # same dropout masks in both passes
+    with torch.no_grad():
+        model(x)
+    local.modulate(y)
+    got = ([p.grad for layer in layers for p in layer.parameters()]
+           + [p.grad for p in local.parameters()])
+
+    torch.manual_seed(2)
+    want = _detached_reference(ref_model, *ref_model.hidden(), ref_heads, x, y)
+
+    assert len(got) == len(want)
+    for layer in layers:
+        assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in layer.parameters())
+    for g, w in zip(got, want):
+        assert torch.allclose(g, w, atol=1e-5, rtol=1e-4)

@@ -20,6 +20,16 @@ the perturbation replaces the activity as the postsynaptic factor:
 
 which is node perturbation or REINFORCE depending on the modulator supplied.
 
+For ``nn.Linear`` / ``nn.ConvNd`` layers the update is computed in closed
+form. Any other module with parameters (a custom layer, a parametrized
+layer, a transposed conv, ...) is handled by an autograd fallback: at
+:meth:`ThreeFactor.modulate` the module is re-run on its captured inputs and
+every trainable parameter gets the vector-Jacobian product of the output with
+``M * post`` -- for a Linear / Conv layer, exactly the closed-form update.
+The fallback needs a module whose forward is deterministic (no dropout or
+batch-norm statistics inside it) and returns one tensor; it does not support
+``mask``, ``pre_fn`` or ``rule="oja"``.
+
 Activities are captured with forward hooks, so the layers themselves are
 untouched. :meth:`ThreeFactor.modulate` writes the update into ``param.grad``
 (as ``-dw``), replacing whatever backprop put there, so any ``torch.optim``
@@ -51,6 +61,14 @@ def _is_conv(module: nn.Module) -> bool:
     return isinstance(module, _ConvNd) and not isinstance(module, _ConvTransposeNd)
 
 
+def first_param(module: nn.Module) -> Tensor:
+    """The module's first parameter (for its device and dtype)."""
+    try:
+        return next(module.parameters())
+    except StopIteration:
+        raise ValueError(f"{type(module).__name__} has no parameters") from None
+
+
 class _Site:
     """One layer under Hebbian control: its hooks, options and captured activity."""
 
@@ -66,10 +84,9 @@ class _Site:
         noise: float,
         reduce: Optional[str] = None,
     ):
-        if not (isinstance(module, nn.Linear) or _is_conv(module)):
-            raise TypeError(
-                f"ThreeFactor supports nn.Linear and nn.Conv1d/2d/3d, got {type(module).__name__}"
-            )
+        # Linear / Conv layers get the closed-form update; any other module
+        # gets the same update by autograd (see _vjp).
+        self.generic = not (isinstance(module, nn.Linear) or _is_conv(module))
         if rule not in _RULES:
             raise ValueError(f"rule must be one of {_RULES}, got {rule!r}")
         if noise < 0:
@@ -83,7 +100,18 @@ class _Site:
                 "noise replaces the postsynaptic activity with the injected perturbation, "
                 'so it cannot be combined with `post`, `post_fn` or rule="oja"'
             )
-        if bias and module.bias is None:
+        self.params: list[nn.Parameter] = []
+        if self.generic:
+            if mask is not None or pre_fn is not None or rule != "hebb":
+                raise ValueError(
+                    f"`mask`, `pre_fn` and rule=\"oja\" need an nn.Linear / nn.ConvNd weight; "
+                    f"{type(module).__name__} is trained by the autograd fallback"
+                )
+            self.params = [p for name, p in module.named_parameters() if p.requires_grad
+                           and (bias or not (name == "bias" or name.endswith(".bias")))]
+            if not self.params:
+                raise ValueError(f"{type(module).__name__} has no trainable parameters")
+        elif bias and module.bias is None:
             raise ValueError("bias=True but the module has no bias")
         if mask is not None:
             mask = torch.as_tensor(mask, dtype=torch.bool)
@@ -101,8 +129,10 @@ class _Site:
         self.noise = float(noise)
         self.reduce = reduce
         # [pre, post] per forward call; with noise, `post` holds xi / sigma.
-        self.captures: list[list[Tensor]] = []
+        # (For the autograd fallback, `pre` is the tuple of all inputs.)
+        self.captures: list[list] = []
         self.enabled = True
+        self._replaying = False  # the fallback's own re-run of the module
 
         self.handles = [module.register_forward_hook(self._capture)]
         if post is not None:
@@ -111,17 +141,21 @@ class _Site:
     # -- hooks ---------------------------------------------------------------
 
     def _capture(self, module, inputs, output):
-        if not (self.enabled and module.training):
+        if not (self.enabled and module.training) or self._replaying:
             return None
+        if self.generic:
+            pre = tuple(i.detach() if torch.is_tensor(i) else i for i in inputs)
+        else:
+            pre = inputs[0].detach()
         if self.noise == 0:
-            self.captures.append([inputs[0].detach(), output.detach()])
+            self.captures.append([pre, output.detach()])
             return None
         xi = torch.randn_like(output)
-        self.captures.append([inputs[0].detach(), xi / self.noise])
+        self.captures.append([pre, xi / self.noise])
         return output + self.noise * xi  # replaces the layer's output
 
     def _capture_post(self, module, inputs, output):
-        if self.enabled and self.module.training and self.captures:
+        if self.enabled and self.module.training and self.captures and not self._replaying:
             if output.shape != self.captures[-1][1].shape:
                 raise ValueError(
                     f"`post` module output shape {tuple(output.shape)} does not match "
@@ -145,27 +179,7 @@ class _Site:
 
         if self.pre_fn is not None:
             pre = self.pre_fn(pre)
-        if self.post_fn is not None:
-            post = self.post_fn(post)
-
-        mod = modulator.to(device=post.device, dtype=post.dtype)
-        if mod.ndim == 1 and post.ndim > 1:  # per-sample signal
-            if mod.shape[0] != post.shape[0]:
-                raise ValueError(
-                    f"per-sample modulator has {mod.shape[0]} entries "
-                    f"but the batch has {post.shape[0]}"
-                )
-            mod = mod.reshape(-1, *([1] * (post.ndim - 1)))
-
-        # Third factor times postsynaptic activity. reduce="all" averages over
-        # every sample and every output position; reduce="sample" (the default
-        # with noise) averages over samples only and sums positions, the same
-        # scaling as the gradient of a per-sample mean loss.
-        if self.reduce == "sample":
-            n = post.shape[0] if post.ndim > 1 else 1
-        else:
-            n = post.numel() // post.shape[ch]
-        g = (mod * post).expand_as(post) / n
+        g, mod, post, n = self._signal(post, modulator, ch)
 
         if conv:
             padding = m.padding
@@ -192,12 +206,71 @@ class _Site:
                 db = db - decay * m.bias
         return dw, db
 
+    def _vjp(self, inputs: tuple, post: Tensor, modulator: Tensor) -> list[Tensor]:
+        """Autograd fallback for modules other than Linear / Conv: the update
+        of every trained parameter is the vector-Jacobian product of the
+        module's output with ``g = M * post / n``, from re-running the module
+        on its captured (detached) inputs. For a Linear / Conv layer this is
+        exactly the closed-form ``g x pre``."""
+        g, *_ = self._signal(post, modulator, 1 if post.ndim > 1 else 0)
+        self._replaying = True
+        try:
+            with torch.enable_grad():
+                out = self.module(*inputs)
+        finally:
+            self._replaying = False
+        if not torch.is_tensor(out) or out.shape != g.shape:
+            raise ValueError(
+                f"re-running {type(self.module).__name__} gave output of shape "
+                f"{tuple(getattr(out, 'shape', ()))}, expected {tuple(g.shape)}"
+            )
+        grads = torch.autograd.grad(out, self.params, g.to(out.dtype), allow_unused=True)
+        return [torch.zeros_like(p) if d is None else d for p, d in zip(self.params, grads)]
+
+    def _signal(self, post: Tensor, modulator: Tensor, ch: int):
+        """``(g, mod, post, n)``: the factor ``g = M * f(post) / n`` that
+        multiplies the presynaptic activity, the broadcast modulator, the
+        transformed postsynaptic activity and the averaging count. ``ch`` is
+        the channel / feature dim of ``post``."""
+        if self.post_fn is not None:
+            post = self.post_fn(post)
+
+        mod = modulator.to(device=post.device, dtype=post.dtype)
+        if mod.ndim == 1 and post.ndim > 1:  # per-sample signal
+            if mod.shape[0] != post.shape[0]:
+                raise ValueError(
+                    f"per-sample modulator has {mod.shape[0]} entries "
+                    f"but the batch has {post.shape[0]}"
+                )
+            mod = mod.reshape(-1, *([1] * (post.ndim - 1)))
+
+        # Third factor times postsynaptic activity. reduce="all" averages over
+        # every sample and every output position; reduce="sample" (the default
+        # with noise) averages over samples only and sums positions, the same
+        # scaling as the gradient of a per-sample mean loss.
+        if self.reduce == "sample":
+            n = post.shape[0] if post.ndim > 1 else 1
+        else:
+            n = post.numel() // post.shape[ch]
+        g = (mod * post).expand_as(post) / n
+        return g, mod, post, n
+
     def modulate(self, modulator: Tensor):
         if not self.captures:
             raise RuntimeError(
                 "no activity captured for this layer since the last modulate()/reset(); "
                 "run a forward pass in training mode first"
             )
+        if self.generic:
+            total = None
+            for inputs, post in self.captures:
+                d = self._vjp(inputs, post, modulator)
+                total = d if total is None else [a + b for a, b in zip(total, d)]
+            self.captures.clear()
+            for p, d in zip(self.params, total):
+                p.grad = -d
+            return
+
         m = self.module
         dw = torch.zeros_like(m.weight)
         db = torch.zeros_like(m.bias) if self.bias else None
@@ -226,11 +299,16 @@ class _Site:
 
 
 class ThreeFactor:
-    """Train selected Linear/Conv weights with a three-factor Hebbian rule.
+    """Train selected layers with a three-factor Hebbian rule.
 
     Args:
         modules: a layer, or an iterable of layers, to put under Hebbian
             control. More can be added (with per-layer options) via :meth:`add`.
+            ``nn.Linear`` / ``nn.ConvNd`` layers use the closed-form update;
+            any other module with parameters uses the autograd fallback (see
+            the module docstring), which trains all of its trainable
+            parameters (those named ``bias`` only with ``bias=True``) and
+            takes the output's dim 1 as its channel dim for ``reduce="all"``.
         mask: bool tensor broadcastable to the layer's weight. ``True`` entries
             are learned with the Hebbian rule; ``False`` entries keep their
             backprop gradient. ``None`` (default) means the whole weight.
@@ -285,9 +363,9 @@ class ThreeFactor:
         self._sites: list[_Site] = []
         if modules is None:
             return
-        if isinstance(modules, nn.Module) and (
-            isinstance(modules, nn.Linear) or _is_conv(modules)
-        ):
+        # A single layer; containers (nn.Sequential, nn.ModuleList) give their
+        # members.
+        if isinstance(modules, nn.Module) and not hasattr(modules, "__iter__"):
             modules = [modules]
         modules = list(modules)
         if len(modules) > 1 and (mask is not None or post is not None):
