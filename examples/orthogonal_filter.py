@@ -22,7 +22,7 @@ d = C_in and P is a learned rotation.
 The rest of the network -- conv -> ReLU -> BN blocks, max-pools, the hidden
 fully connected layer and the readout -- is the VGG of examples/cifar10_vgg.py,
 and training (methods gd, dfa, local, local-bio and frozen; options; alignment
-probe; results CSV and plot) is that of examples/cifar10_resnet.py. The
+probe; results CSV and plot) is that of examples/cifar10_common.py. The
 three-factor rules (DirectFeedback, LocalLoss) handle OrthogonalFilterConv
 through modul8's autograd fallback: the layer is re-run on its captured input
 and the modulated error is backpropagated through it alone, so P's update
@@ -51,7 +51,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.parametrizations import orthogonal
 
-from cifar10_resnet import add_args, norm, run
+from cifar10_common import add_args, norm, run
 from cifar10_vgg import ARCHS, Block
 
 
@@ -136,7 +136,7 @@ class OrthogonalFilterVGG(nn.Module):
         return [(b.layer, b.relu) for b in blocks]
 
     def param_groups(self, named_params, wd: float):
-        """Optimizer groups (used by cifar10_resnet.train): weight decay on
+        """Optimizer groups (used by cifar10_common.train): weight decay on
         weights only, not on the projections' unconstrained `original`
         tensors or on biases."""
         decay, no_decay = [], []

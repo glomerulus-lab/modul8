@@ -415,6 +415,12 @@ readout is always trained by backprop.
 uv run --group examples python examples/cifar10_resnet.py --arch resnet20
 ```
 
+The CIFAR-10 scripts (this one, the VGG one below and
+`examples/orthogonal_filter.py`) each define only their model. Data loading,
+the methods, the training loop, the alignment probe, the CSV and plot, and the
+shared command-line options live in `examples/cifar10_common.py`, whose
+docstring also lists what a model must provide to plug in.
+
 Each block is `BN(ReLU(conv1(x)))`, then `BN(ReLU(conv2(h) + shortcut(x)))`,
 with `affine=False` batch norm after the ReLU as in the MNIST example. A
 block's conv2 and projection shortcut feed the same units, so they share one
