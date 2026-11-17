@@ -351,6 +351,15 @@ matrices per layer. The reference code's bio recipes use `beta=0.01` for
   unnecessary.
 - `hebb.remove()` detaches the hooks; `ThreeFactor` also works as a context
   manager.
+- **Other layers.** `ThreeFactor`, `DirectFeedback` and `LocalLoss` also accept
+  any module with parameters (a custom layer, a parametrized layer, a
+  transposed conv). Such a module is re-run on its captured input at
+  `modulate()` time, and each trainable parameter gets the vector-Jacobian
+  product of the output with `M · post`. For an `nn.Linear` / `nn.ConvNd` that
+  is exactly the closed-form update. The module's forward must be
+  deterministic and return one tensor. `mask`, `pre_fn` and `rule="oja"` are
+  not supported. Parameters named `bias` are trained only with `bias=True`.
+  With `reduce="all"`, dim 1 of the output is taken as the channel dim.
 
 ## Example: MNIST learning curves
 

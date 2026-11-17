@@ -20,7 +20,7 @@ from typing import Callable, Iterable, Optional, Sequence, Union
 import torch
 from torch import Tensor, nn
 
-from .three_factor import ThreeFactor
+from .three_factor import ThreeFactor, first_param
 
 
 def relu_derivative(post: Tensor) -> Tensor:
@@ -42,7 +42,8 @@ class DirectFeedback:
     """Train layers by direct feedback alignment.
 
     Args:
-        layers: a layer, or an iterable of ``nn.Linear`` / ``nn.ConvNd`` layers.
+        layers: a layer, or an iterable of layers: ``nn.Linear`` / ``nn.ConvNd``,
+            or any module with parameters (see :class:`~modul8.ThreeFactor`).
         n_out: size of the output error passed to :meth:`modulate`.
         posts: for each layer, the module whose output feeds ``derivative``
             (typically the nonlinearity after the layer), or ``None`` to use the
@@ -110,7 +111,7 @@ class DirectFeedback:
         if B is None:
             B = torch.randn(self.n_out, size, generator=self.generator)
             B = (B * (self.scale / math.sqrt(self.n_out))).to(
-                device=layer.weight.device, dtype=layer.weight.dtype)
+                device=first_param(layer).device, dtype=first_param(layer).dtype)
             self.feedback[i] = B
         elif B.shape != (self.n_out, size):
             raise ValueError(
@@ -166,7 +167,7 @@ class DirectFeedback:
             raise ValueError(f"state has {len(feedback)} matrices for {len(self.layers)} layers")
         self.feedback = [
             None if B is None else torch.as_tensor(B).to(
-                device=layer.weight.device, dtype=layer.weight.dtype)
+                device=first_param(layer).device, dtype=first_param(layer).dtype)
             for B, layer in zip(feedback, self.layers)
         ]
 

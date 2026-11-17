@@ -213,3 +213,29 @@ def test_dfa_paused_and_remove():
     dfa.remove()
     fc(torch.randn(2, 4))
     assert dfa.tf._sites == []
+
+
+def test_dfa_wrapped_layer_matches_plain_layer():
+    """DirectFeedback on a custom module (autograd fallback) gives the same
+    update as on the plain conv inside it."""
+
+    class Wrapped(nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layer = layer
+
+        def forward(self, x):
+            return self.layer(x)
+
+    grads = []
+    for wrap in (False, True):
+        torch.manual_seed(0)
+        conv, relu = nn.Conv2d(3, 4, 3), nn.ReLU()
+        layer = Wrapped(conv) if wrap else conv
+        dfa = DirectFeedback(layer, n_out=5, posts=[relu],
+                             generator=torch.Generator().manual_seed(1))
+        relu(layer(torch.randn(6, 3, 7, 7)))
+        dfa.modulate(torch.randn(6, 5))
+        grads.append((conv.weight.grad, conv.bias.grad))
+    for a, b in zip(*grads):
+        assert torch.allclose(a, b, atol=1e-6)

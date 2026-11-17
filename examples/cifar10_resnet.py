@@ -68,6 +68,7 @@ from torch import nn
 from torchvision import datasets
 
 from modul8 import DirectFeedback, LocalLoss
+from modul8.three_factor import first_param
 
 METHODS = ("gd", "dfa", "local", "local-bio", "frozen")
 LABELS = {
@@ -286,8 +287,8 @@ def feedback_matrices(model, hidden, n_out: int, scale: float, share_shortcut: b
                 math.prod(spatial), dim=1)
         else:
             B = torch.randn(n_out, math.prod(shape), generator=generator)
-        B = (B * (scale / math.sqrt(n_out))).to(device=layer.weight.device,
-                                               dtype=layer.weight.dtype)
+        w = first_param(layer)
+        B = (B * (scale / math.sqrt(n_out))).to(device=w.device, dtype=w.dtype)
         by_post[id(post)] = B
         mats.append(B)
     return mats
@@ -299,7 +300,8 @@ def alignment(model, rule, deliver, layers, x, y, extra_params=()) -> list[float
     gradient on (x, y). Leaves parameters, grads (of the layers, the readout
     and `extra_params`) and batch-norm statistics unchanged."""
     buffers = {k: v.clone() for k, v in model.named_buffers()}
-    params = [p for layer in layers for p in (layer.weight, layer.bias)] + list(extra_params)
+    per_layer = [list(layer.parameters()) for layer in layers]
+    params = [p for ps in per_layer for p in ps] + list(extra_params)
     saved = [None if p.grad is None else p.grad.clone() for p in params]
     hidden_grad = model.hidden_grad
 
@@ -309,11 +311,9 @@ def alignment(model, rule, deliver, layers, x, y, extra_params=()) -> list[float
         p.grad = None
     logits = model(x)
     F.cross_entropy(logits, y).backward()
-    true = [torch.cat([layer.weight.grad.flatten(), layer.bias.grad.flatten()])
-            for layer in layers]
+    true = [torch.cat([p.grad.flatten() for p in ps]) for ps in per_layer]
     deliver(logits.detach(), y)
-    est = [torch.cat([layer.weight.grad.flatten(), layer.bias.grad.flatten()])
-           for layer in layers]
+    est = [torch.cat([p.grad.flatten() for p in ps]) for ps in per_layer]
     cos = [F.cosine_similarity(a, b, dim=0).item() for a, b in zip(true, est)]
 
     model.hidden_grad = hidden_grad
@@ -331,21 +331,34 @@ def alignment(model, rule, deliver, layers, x, y, extra_params=()) -> list[float
 def train(method: str, data, args, seed: int, build_model, label: str = "") -> dict:
     """Train one model, built by `build_model(args)`, and return its per-epoch
     history. The model must provide `hidden()` ((layer, post) pairs), an `fc`
-    readout and a `hidden_grad` flag, as ResNet does."""
+    readout and a `hidden_grad` flag, as ResNet does. Optionally:
+
+      * `param_groups(named_params, wd)` -> optimizer param groups, to choose
+        which of the readout's and hidden layers' parameters get weight decay
+        (default: all of them);
+      * `epoch_metrics()` -> {name: float}, logged after every epoch and
+        saved under history["extra"]."""
     (x, y), (x_test, y_test) = data
     device = x.device
     torch.manual_seed(seed)
     model = build_model(args).to(device)
     hidden = model.hidden()
     layers = [layer for layer, _ in hidden]
-    hidden_params = [p for layer in layers for p in layer.parameters()]
+    hidden_named = [(n, p) for layer in layers for n, p in layer.named_parameters()]
+
+    def groups(named, wd):
+        if hasattr(model, "param_groups"):
+            return model.param_groups(named, wd)
+        return [{"params": [p for _, p in named], "weight_decay": wd}]
 
     # The readout is always trained by backprop.
-    opts = [make_optimizer(model.fc.parameters(), args.opt, args.lr, args.wd, args.momentum)]
+    opts = [make_optimizer(groups(model.fc.named_parameters(), args.wd), args.opt, args.lr,
+                           args.wd, args.momentum)]
     rule = deliver = None
     readout_scale = 1.0  # multiplies the readout's loss before backward
     if method == "gd":
-        opts.append(make_optimizer(hidden_params, args.opt, args.lr, args.wd, args.momentum))
+        opts.append(make_optimizer(groups(hidden_named, args.wd), args.opt, args.lr, args.wd,
+                                   args.momentum))
     elif method == "dfa":
         model.hidden_grad = False
         rule = DirectFeedback(layers, n_out=10, posts=[post for _, post in hidden])
@@ -354,8 +367,8 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
             args.dfa_feedback == "tied", torch.Generator().manual_seed(seed), device)})
         # Output error e = softmax - one-hot, i.e. dLoss/dlogits per sample.
         deliver = lambda logits, yb: rule.modulate(logits.softmax(1) - F.one_hot(yb, 10))
-        opts.append(make_optimizer(hidden_params, args.dfa_opt, args.dfa_lr, args.dfa_wd,
-                                   args.momentum))
+        opts.append(make_optimizer(groups(hidden_named, args.dfa_wd), args.dfa_opt,
+                                   args.dfa_lr, args.dfa_wd, args.momentum))
     elif method in ("local", "local-bio"):
         model.hidden_grad = False
         bio = method == "local-bio"
@@ -375,8 +388,10 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
         elif args.local_loss == "predsim":
             readout_scale = 1 - beta
         # The heads are trained alongside the layers they serve.
-        opts.append(make_optimizer(hidden_params + list(rule.parameters()), args.local_opt,
-                                   args.local_lr, args.local_wd, args.momentum))
+        heads = {"params": list(rule.parameters()), "weight_decay": args.local_wd}
+        opts.append(make_optimizer(groups(hidden_named, args.local_wd) + [heads],
+                                   args.local_opt, args.local_lr, args.local_wd,
+                                   args.momentum))
     else:  # frozen: the hidden parameters are in no optimizer
         model.hidden_grad = False
 
@@ -390,7 +405,7 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
     probe = torch.randperm(len(x_test), generator=gen)[:args.batch_size].to(device)
     x_probe, y_probe = x_test[probe], y_test[probe]
 
-    history = {"train": [], "test": [], "loss": [], "align": []}
+    history = {"train": [], "test": [], "loss": [], "align": [], "extra": {}}
     t_run = time.time()
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -426,6 +441,9 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
         history["train"].append(train_acc)
         history["test"].append(test_acc)
         history["loss"].append(loss_sum / seen)
+        metrics = model.epoch_metrics() if hasattr(model, "epoch_metrics") else {}
+        for key, val in metrics.items():
+            history["extra"].setdefault(key, []).append(val)
         align = ""
         if rule is not None and args.align_every and (epoch % args.align_every == 0
                                                       or epoch == args.epochs):
@@ -436,7 +454,9 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
         if args.progress:
             sys.stderr.write("\r\033[K")
         print(f"{label} ep {epoch:>3}  loss {loss_sum / seen:.3f}  train {train_acc:6.2f}%  "
-              f"test {test_acc:6.2f}%{align}  ({time.time() - t0:.0f}s)", flush=True)
+              f"test {test_acc:6.2f}%{align}"
+              + "".join(f"  {key} {val:.2g}" for key, val in metrics.items())
+              + f"  ({time.time() - t0:.0f}s)", flush=True)
 
     history["time"] = time.time() - t_run
     if rule is not None:
@@ -621,14 +641,10 @@ def add_args(p: argparse.ArgumentParser, archs, default_arch: str):
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
 
-def run(args, build_model, train_fn=None):
+def run(args, build_model):
     """Train every method for every seed, then print a summary and save the
     results table (CSV), the plot (and JSON, if asked). The CSV is rewritten
-    after every run, so a crash keeps the runs finished so far.
-
-    `train_fn` (default: `train`) trains one run, with `train`'s signature
-    and history format."""
-    train_fn = train_fn or train
+    after every run, so a crash keeps the runs finished so far."""
     if args.device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
     (x, y), test = load_cifar10(args.data, args.device)
@@ -646,7 +662,7 @@ def run(args, build_model, train_fn=None):
     results = {m: [] for m in args.methods}
     for seed in range(args.seeds):
         for method in args.methods:
-            hist = train_fn(method, data, args, seed, build_model,
+            hist = train(method, data, args, seed, build_model,
                          label=f"seed {seed}  {method:<6}")
             results[method].append(hist)
             print(f"seed {seed}  {method:<6} final train {hist['train'][-1]:6.2f}%  "

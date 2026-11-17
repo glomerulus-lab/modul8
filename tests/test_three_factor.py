@@ -100,10 +100,112 @@ def test_capture_lifecycle():
 
 
 def test_rejects_unsupported():
-    with pytest.raises(TypeError):
-        ThreeFactor().add(nn.ConvTranspose2d(2, 2, 3))
     with pytest.raises(ValueError):
         ThreeFactor(nn.Linear(2, 2, bias=False), bias=True)
+    with pytest.raises(ValueError):  # nothing to train
+        ThreeFactor(nn.ReLU())
+    for kwargs in ({"mask": torch.ones(2, 2, dtype=torch.bool)}, {"rule": "oja"},
+                   {"pre_fn": torch.relu}):
+        with pytest.raises(ValueError):  # need a Linear / Conv weight
+            ThreeFactor(Wrapped(nn.Linear(2, 2)), **kwargs)
+
+
+# -- autograd fallback for other modules -----------------------------------------
+
+
+class Wrapped(nn.Module):
+    """A Linear / Conv layer hidden inside a custom module, so ThreeFactor
+    must use the autograd fallback for it."""
+
+    def __init__(self, layer):
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, x):
+        return self.layer(x)
+
+
+def _twins(make, seed=0):
+    torch.manual_seed(seed)
+    plain = make()
+    wrapped = Wrapped(make())
+    wrapped.layer.load_state_dict(plain.state_dict())
+    return plain, wrapped
+
+
+@pytest.mark.parametrize("make,shape", LAYERS)
+@pytest.mark.parametrize("reduce", ["all", "sample"])
+def test_autograd_fallback_matches_closed_form(make, shape, reduce):
+    if reduce == "all" and (make, shape) == LAYERS[1]:
+        pytest.skip("Linear on (batch, seq, features): reduce='all' treats the last dim "
+                    "as features, the fallback treats dim 1 as channels")
+    plain, wrapped = _twins(make)
+    x = torch.randn(shape)
+    out_shape = plain(x).shape
+    mod = torch.randn(out_shape)  # per-neuron (and per-position) modulator
+    for layer in (plain, wrapped):
+        hebb = ThreeFactor(layer, bias=True, post_fn=torch.tanh, reduce=reduce)
+        layer(x)
+        layer(2 * x)  # passes accumulate in both paths
+        hebb.modulate(mod)
+        hebb.remove()
+    assert torch.allclose(wrapped.layer.weight.grad, plain.weight.grad, atol=1e-5)
+    assert torch.allclose(wrapped.layer.bias.grad, plain.bias.grad, atol=1e-5)
+
+
+def test_autograd_fallback_with_post_module_and_noise():
+    plain, wrapped = _twins(lambda: nn.Conv2d(3, 4, 3, padding=1))
+    x, m = torch.randn(5, 3, 6, 6), torch.randn(5)
+    grads = []
+    for layer in (plain, wrapped):
+        hebb = ThreeFactor(layer, noise=0.3, bias=True)
+        torch.manual_seed(1)
+        layer(x)
+        hebb.modulate(m)
+        grads.append((layer.weight.grad, layer.bias.grad) if layer is plain
+                     else (layer.layer.weight.grad, layer.layer.bias.grad))
+    for a, b in zip(*grads):
+        assert torch.allclose(a, b, atol=1e-5)
+
+    plain, wrapped = _twins(lambda: nn.Linear(6, 4))
+    for layer in (plain, wrapped):
+        relu = nn.ReLU()
+        hebb = ThreeFactor(layer, post=relu)
+        relu(layer(torch.randn(8, 6, generator=torch.Generator().manual_seed(2))))
+        hebb.modulate(1.0)
+    assert torch.allclose(wrapped.layer.weight.grad, plain.weight.grad, atol=1e-6)
+
+
+def test_autograd_fallback_other_layers():
+    """A transposed conv (no closed form here) gets the autograd reference."""
+    torch.manual_seed(0)
+    layer, x = nn.ConvTranspose2d(3, 4, 3, stride=2), torch.randn(2, 3, 5, 5)
+    hebb = ThreeFactor(layer, bias=True)
+    layer(x)
+    hebb.modulate(0.7)
+    assert not hebb._sites[0].captures  # the re-run itself is not captured
+    hebb.remove()
+    ref_w, ref_b = reference(layer, x, 0.7)
+    assert torch.allclose(layer.weight.grad, ref_w, atol=1e-6)
+    assert torch.allclose(layer.bias.grad, ref_b, atol=1e-6)
+
+
+def test_autograd_fallback_bias_flag_and_frozen_params():
+    torch.manual_seed(0)
+    layer = Wrapped(nn.Linear(4, 3))
+    layer.layer.weight.requires_grad_(False)
+    with pytest.raises(ValueError):  # only the bias is trainable, and bias=False
+        ThreeFactor(layer)
+    hebb = ThreeFactor(layer, bias=True)
+    layer(torch.randn(2, 4))
+    hebb.modulate(1.0)
+    assert layer.layer.weight.grad is None and layer.layer.bias.grad is not None
+
+    layer = Wrapped(nn.Linear(4, 3))
+    hebb = ThreeFactor(layer)  # bias=False: the weight only
+    layer(torch.randn(2, 4))
+    hebb.modulate(1.0)
+    assert layer.layer.weight.grad is not None and layer.layer.bias.grad is None
 
 
 def test_learns_with_optimizer():

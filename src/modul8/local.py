@@ -51,7 +51,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .feedback import relu_derivative
-from .three_factor import ThreeFactor
+from .three_factor import ThreeFactor, first_param
 
 _LOSSES = ("pred", "sim", "predsim")
 
@@ -237,7 +237,8 @@ class LocalLoss:
     """Train layers with layer-local error signals.
 
     Args:
-        layers: a layer, or an iterable of ``nn.Linear`` / ``nn.ConvNd`` layers.
+        layers: a layer, or an iterable of layers: ``nn.Linear`` / ``nn.ConvNd``,
+            or any module with parameters (see :class:`~modul8.ThreeFactor`).
         n_classes: number of classes (for the default heads).
         posts: for each layer, the module whose output the local loss reads
             (typically the nonlinearity after the layer), or ``None`` for the
@@ -356,7 +357,7 @@ class LocalLoss:
         self.shapes = shapes
         for g, group in enumerate(self.groups):
             if self.heads[g] is None:
-                w = self.layers[group[0]].weight
+                w = first_param(self.layers[group[0]])
                 self.heads[g] = LocalHead(shapes[group[0]], self.n_classes,
                                           **self.head_kwargs).to(device=w.device, dtype=w.dtype)
 
