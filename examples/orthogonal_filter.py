@@ -20,38 +20,60 @@ first layer, C_in = 3) there is nothing to project away, so that layer uses
 d = C_in and P is a learned rotation.
 
 The rest of the network -- conv -> ReLU -> BN blocks, max-pools, the hidden
-fully connected layer and the readout -- is the vgg8 of
-examples/cifar10_vgg.py, and the model exposes the same `hidden()` /
-`hidden_grad` interface, so it can later be trained with the local rules via
-that example's training loop.
+fully connected layer and the readout -- is the VGG of examples/cifar10_vgg.py.
 
-Training is plain backprop on every learned parameter (the projections P,
-the conv biases, the hidden fully connected layer and the readout), with the
-data pipeline, optimizer and lr schedule of examples/cifar10_resnet.py. Each
-epoch also logs max |P P^T - I| as a check that the projections stay
+Methods (as in examples/cifar10_vgg.py; the readout is always trained by
+backprop):
+
+    gd         every learned parameter trained by backprop
+    local      layer-local error signals (Nøkland & Eidnes, 2019): each hidden
+               layer -- every conv and the hidden fc layer -- is trained by
+               the gradient of a local loss computed by a modul8.LocalHead on
+               its ReLU output (--local-loss pred, sim or predsim)
+    local-bio  the same with the reference code's "bio" heads
+    frozen     hidden layers left at their random initialisation
+
+modul8.LocalLoss writes its updates straight into `layer.weight.grad`, so it
+needs plain Linear / Conv layers and cannot drive the parametrized P. Here
+the same update is computed by autograd instead: each hidden layer's input
+(and the readout's) is detached, so the backward pass of a layer's local
+loss stops at that layer. That is backprop confined to the layer and its
+head -- what LocalLoss computes for an ordinary layer -- and it reaches P
+through the orthogonal parametrization.
+
+Data pipeline, optimizers, lr schedule, alignment probe (--align-every),
+results CSV and plot are those of examples/cifar10_resnet.py. Weight decay
+applies to the fully connected weights only: not to the projections'
+unconstrained `original` tensors (decaying them means nothing for P, which
+stays orthonormal), nor to biases. Each epoch also logs max |P P^T - I|
+(column ortho_err in the CSV) as a check that the projections stay
 orthonormal.
 
 Run from the repository root:
 
     uv run --group examples python examples/orthogonal_filter.py --d 32
+    uv run --group examples python examples/orthogonal_filter.py --d 32 --methods gd local
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import statistics
 import sys
 import time
-from csv import DictWriter
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.parametrizations import orthogonal
 
-from cifar10_resnet import accuracy, augment, load_cifar10, make_optimizer, make_schedule, norm, progress
+from cifar10_resnet import (accuracy, add_args, augment, make_optimizer, make_schedule, norm,
+                            output_shapes, progress, run)
 from cifar10_vgg import ARCHS, Block
+from modul8 import LocalHead
+
+METHODS = ("gd", "local", "local-bio", "frozen")
 
 
 class OrthogonalFilterConv(nn.Module):
@@ -135,45 +157,154 @@ class OrthogonalFilterVGG(nn.Module):
         return [(b.layer, b.relu) for b in blocks]
 
 
-# -- training (plain backprop) -------------------------------------------------
+
+# -- training ------------------------------------------------------------------
 
 
 def orthogonality_error(model) -> float:
     """max |P P^T - I| over every conv's projection."""
     errs = []
-    for conv in (m for m in model.modules() if isinstance(m, OrthogonalFilterConv)):
-        P = conv.proj.weight
-        errs.append((P @ P.T - torch.eye(conv.d, device=P.device)).abs().max().item())
+    with torch.no_grad():
+        for conv in (m for m in model.modules() if isinstance(m, OrthogonalFilterConv)):
+            P = conv.proj.weight
+            errs.append((P @ P.T - torch.eye(conv.d, device=P.device)).abs().max().item())
     return max(errs)
 
 
-def param_groups(model, wd: float):
-    """Weight decay on the fully connected weights only. The projections'
-    unconstrained `original` tensors are excluded (decaying them has no
-    meaning for P, which stays orthonormal), as are the biases."""
+def param_groups(named_params, wd: float):
+    """Weight decay on weights only: the projections' unconstrained
+    `original` tensors and all biases are excluded."""
     decay, no_decay = [], []
-    for name, p in model.named_parameters():
+    for name, p in named_params:
         (no_decay if "parametrizations" in name or name.endswith("bias") else decay).append(p)
     return [{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}]
 
 
-def train(args, data, seed: int) -> dict:
+class LocalSignals:
+    """Layer-local training by autograd. Forward pre-hooks detach the input
+    of every hidden layer and of the readout; forward hooks keep each hidden
+    layer's post (ReLU) output. `loss(y)` sums the heads' local losses on
+    those outputs, so backward sends each layer only its own head's error."""
+
+    def __init__(self, model, hidden, heads):
+        self.heads = heads
+        self.acts: list[torch.Tensor] = []
+        self.enabled = True
+        self.handles = [model.fc.register_forward_pre_hook(self._detach)]
+        for layer, post in hidden:
+            self.handles.append(layer.register_forward_pre_hook(self._detach))
+            self.handles.append(post.register_forward_hook(self._capture))
+
+    def _detach(self, module, inputs):
+        return tuple(i.detach() for i in inputs) if self.enabled else None
+
+    def _capture(self, module, inputs, output):
+        if self.enabled and module.training:
+            self.acts.append(output)
+
+    def loss(self, y):
+        """Sum of the local losses of the last training forward pass."""
+        acts, self.acts = self.acts, []
+        if len(acts) != len(self.heads):
+            raise RuntimeError(f"captured {len(acts)} activities for {len(self.heads)} heads; "
+                               "run exactly one training-mode forward pass first")
+        return sum(head(h, y) for head, h in zip(self.heads, acts))
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+        self.acts.clear()
+
+
+def alignment(model, local, layers, x, y) -> list[float]:
+    """Cosine between each layer's local-loss gradient and its backprop
+    gradient on (x, y). Leaves parameters, .grad and batch-norm statistics
+    unchanged; both passes see the same dropout masks."""
+    buffers = {k: v.clone() for k, v in model.named_buffers()}
+    per_layer = [list(layer.parameters()) for layer in layers]
+    params = [p for ps in per_layer for p in ps]
+    devices = [x.device] if x.is_cuda else []
+
+    def grads(enabled):
+        local.enabled = enabled
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(0)
+            logits = model(x)
+            loss = local.loss(y) if enabled else F.cross_entropy(logits, y)
+        return torch.autograd.grad(loss, params)
+
+    try:
+        true, est = grads(False), grads(True)
+    finally:
+        local.enabled = True
+        local.acts.clear()
+        for k, v in model.named_buffers():
+            v.copy_(buffers[k])
+
+    cos, i = [], 0
+    for ps in per_layer:
+        a = torch.cat([g.flatten() for g in true[i:i + len(ps)]])
+        b = torch.cat([g.flatten() for g in est[i:i + len(ps)]])
+        cos.append(F.cosine_similarity(a, b, dim=0).item())
+        i += len(ps)
+    return cos
+
+
+def train(method: str, data, args, seed: int, build_model, label: str = "") -> dict:
+    """One run; same signature and history as cifar10_resnet.train, plus the
+    per-epoch orthogonality error under history["extra"]."""
     (x, y), (x_test, y_test) = data
     device = x.device
     torch.manual_seed(seed)
-    model = OrthogonalFilterVGG(args.d, args.arch, args.feat_mult, args.num_hidden,
-                                args.dropout, batchnorm=args.batchnorm).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"seed {seed}  d={args.d}  trainable parameters {n_params:,}", flush=True)
+    model = build_model(args).to(device)
+    hidden = model.hidden()
+    layers = [layer for layer, _ in hidden]
+    hidden_named = [(n, p) for layer in layers for n, p in layer.named_parameters()]
 
-    opt = make_optimizer(param_groups(model, args.wd), args.opt, args.lr, args.wd,
-                         args.momentum)
+    # The readout is always trained by backprop.
+    opts = [make_optimizer(param_groups(model.fc.named_parameters(), args.wd), args.opt,
+                           args.lr, args.wd, args.momentum)]
+    local = None
+    readout_scale = 1.0  # multiplies the readout's loss before backward
+    if method == "gd":
+        opts.append(make_optimizer(param_groups(hidden_named, args.wd), args.opt, args.lr,
+                                   args.wd, args.momentum))
+    elif method in ("local", "local-bio"):
+        bio = method == "local-bio"
+        beta = args.local_bio_beta if bio else args.local_beta
+        gen = torch.Generator().manual_seed(seed)  # bio heads' fixed random matrices
+        heads = nn.ModuleList(
+            LocalHead(shape, 10, loss=args.local_loss, beta=beta,
+                      dim_in_decoder=args.local_dim_in_decoder, bio=bio,
+                      target_proj_size=args.local_target_proj_size, generator=gen)
+            for shape in output_shapes(model, layers, device)).to(device)
+        local = LocalSignals(model, hidden, heads)
+        # As in the reference code: the readout starts at zero and, for
+        # predsim, its loss is scaled by (1 - beta).
+        if args.local_readout_zero_init:
+            nn.init.zeros_(model.fc.weight)
+        if args.local_readout_scale is not None:
+            readout_scale = args.local_readout_scale
+        elif args.local_loss == "predsim":
+            readout_scale = 1 - beta
+        # The heads are trained alongside the layers they serve.
+        opts.append(make_optimizer(param_groups(hidden_named + list(heads.named_parameters()),
+                                                args.local_wd),
+                                   args.local_opt, args.local_lr, args.local_wd, args.momentum))
+    else:  # frozen: the hidden parameters are in no optimizer
+        model.hidden_grad = False
+
     steps_per_epoch = len(x) // args.batch_size
-    sched = make_schedule(opt, args.epochs * steps_per_epoch,
-                          args.warmup_epochs * steps_per_epoch, args.schedule,
-                          args.min_lr_frac)
+    total = args.epochs * steps_per_epoch
+    schedulers = [make_schedule(opt, total, args.warmup_epochs * steps_per_epoch,
+                                args.schedule, args.min_lr_frac) for opt in opts]
 
-    history = {"epoch": [], "loss": [], "train": [], "test": [], "ortho_err": []}
+    # A fixed held-out-from-training batch for the alignment probe.
+    gen = torch.Generator().manual_seed(seed)
+    probe = torch.randperm(len(x_test), generator=gen)[:args.batch_size].to(device)
+    x_probe, y_probe = x_test[probe], y_test[probe]
+
+    history = {"train": [], "test": [], "loss": [], "align": [], "extra": {"ortho_err": []}}
     t_run = time.time()
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -187,96 +318,73 @@ def train(args, data, seed: int) -> dict:
                 xb = augment(xb)
             logits = model(xb)
             loss = F.cross_entropy(logits, yb)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            sched.step()
+            objective = readout_scale * loss
+            if local is not None:
+                objective = objective + local.loss(yb)
+            for opt in opts:
+                opt.zero_grad(set_to_none=True)
+            objective.backward()
+            for opt in opts:
+                opt.step()
+            for sched in schedulers:
+                sched.step()
 
             loss_sum += loss.item() * len(yb)
             correct += (logits.argmax(1) == yb).sum().item()
             seen += len(yb)
             if args.progress and (k + 1) % 20 == 0:
-                progress(f"seed {seed} ep {epoch:>3}", k + 1, steps_per_epoch,
+                progress(f"{label} ep {epoch:>3}", k + 1, steps_per_epoch,
                          loss_sum / seen, 100.0 * correct / seen, t0)
 
         train_acc = 100.0 * correct / seen  # running, on augmented batches
         test_acc = accuracy(model, x_test, y_test)
         ortho = orthogonality_error(model)
-        for key, val in zip(history, (epoch, loss_sum / seen, train_acc, test_acc, ortho)):
-            history[key].append(val)
+        history["train"].append(train_acc)
+        history["test"].append(test_acc)
+        history["loss"].append(loss_sum / seen)
+        history["extra"]["ortho_err"].append(ortho)
+        align = ""
+        if local is not None and args.align_every and (epoch % args.align_every == 0
+                                                       or epoch == args.epochs):
+            cos = alignment(model, local, layers, x_probe, y_probe)
+            history["align"].append((epoch, cos))
+            align = f"  align {statistics.fmean(cos):+.3f}"
         if args.progress:
             sys.stderr.write("\r\033[K")
-        print(f"seed {seed} ep {epoch:>3}  loss {loss_sum / seen:.3f}  train {train_acc:6.2f}%  "
-              f"test {test_acc:6.2f}%  |PP^T-I| {ortho:.1e}  ({time.time() - t0:.0f}s)",
+        print(f"{label} ep {epoch:>3}  loss {loss_sum / seen:.3f}  train {train_acc:6.2f}%  "
+              f"test {test_acc:6.2f}%{align}  |PP^T-I| {ortho:.1e}  ({time.time() - t0:.0f}s)",
               flush=True)
 
     history["time"] = time.time() - t_run
+    if local is not None:
+        local.remove()
     return history
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    add_args(p, ARCHS, "vgg8")
+    p.set_defaults(methods=list(METHODS))
     p.add_argument("--d", type=int, default=32,
                    help="dimension of each conv's learned projection (capped at C_in)")
-    p.add_argument("--arch", choices=list(ARCHS), default="vgg8")
     p.add_argument("--feat-mult", type=float, default=1.0, help="width multiplier for the convs")
     p.add_argument("--num-hidden", type=int, default=1024,
                    help="units in the hidden fully connected layer")
-    p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--batchnorm", action=argparse.BooleanOptionalAction, default=True,
-                   help="batch norm (affine=False) after each ReLU")
-    p.add_argument("--seeds", type=int, default=1)
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--train-size", type=int, default=0,
-                   help="use only the first n training images (0: all 50,000)")
-    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
-                   help="random crop + horizontal flip")
-    p.add_argument("--opt", choices=("sgd", "adam"), default="sgd",
-                   help="optimizer (adam means AdamW)")
-    p.add_argument("--lr", type=float, default=0.1)
-    p.add_argument("--wd", type=float, default=5e-4,
-                   help="weight decay (fully connected weights only)")
-    p.add_argument("--momentum", type=float, default=0.9, help="SGD momentum (Nesterov)")
-    p.add_argument("--schedule", choices=("constant", "cosine", "step"), default="cosine")
-    p.add_argument("--warmup-epochs", type=int, default=1, help="linear lr warmup")
-    p.add_argument("--min-lr-frac", type=float, default=0.0,
-                   help="final lr as a fraction of the initial lr")
-    p.add_argument("--no-progress", dest="progress", action="store_false",
-                   help="disable the progress bar")
-    p.add_argument("--data", default="data", help="dataset download directory")
-    p.add_argument("--csv", help="per-epoch results table; a timestamp is added to the name "
-                                 "(default: cifar10_<arch>_orthogonal_d<d>.csv)")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="dropout after each hidden layer's batch norm")
     args = p.parse_args()
+    if unsupported := [m for m in args.methods if m not in METHODS]:
+        p.error(f"methods {unsupported} are not supported here (choose from {list(METHODS)})")
 
-    if args.device.startswith("cuda"):
-        torch.backends.cudnn.benchmark = True
-    (x, y), test = load_cifar10(args.data, args.device)
-    if args.train_size:
-        x, y = x[:args.train_size], y[:args.train_size]
-    if len(x) < args.batch_size:
-        sys.exit("--train-size must be at least --batch-size")
-    data = ((x, y), test)
+    mult = "" if args.feat_mult == 1 else f" ({args.feat_mult:g}x)"
+    args.arch_label = f"{args.arch}{mult}, orthogonal d={args.d}"
+    if args.out is None:
+        suffix = "" if args.feat_mult == 1 else f"_{args.feat_mult:g}x"
+        args.out = f"cifar10_{args.arch}{suffix}_orthogonal_d{args.d}.png"
 
-    base = Path(args.csv or f"cifar10_{args.arch}_orthogonal_d{args.d}.csv")
-    csv = base.with_name(f"{base.stem}_{time.strftime('%Y%m%d-%H%M%S')}{base.suffix or '.csv'}")
-
-    rows = []
-    for seed in range(args.seeds):
-        hist = train(args, data, seed)
-        print(f"seed {seed} final train {hist['train'][-1]:6.2f}%  "
-              f"test {hist['test'][-1]:6.2f}%  best test {max(hist['test']):6.2f}%  "
-              f"({hist['time']:.0f}s)\n", flush=True)
-        rows += [{"seed": seed, "d": args.d, "arch": args.arch,
-                  **{k: hist[k][i] for k in ("epoch", "loss", "train", "test", "ortho_err")}}
-                 for i in range(len(hist["epoch"]))]
-        # Rewritten after every seed, so a crash keeps the finished runs.
-        with open(csv, "w", newline="") as f:
-            writer = DictWriter(f, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
-    print(f"Saved {csv}")
+    run(args, lambda a: OrthogonalFilterVGG(a.d, a.arch, a.feat_mult, a.num_hidden, a.dropout,
+                                            batchnorm=a.batchnorm),
+        train_fn=train)
 
 
 if __name__ == "__main__":

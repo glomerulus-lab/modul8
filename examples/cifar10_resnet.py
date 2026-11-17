@@ -448,9 +448,9 @@ def train(method: str, data, args, seed: int, build_model, label: str = "") -> d
 
 
 def results_frame(results, args):
-    """One row per (method, seed, epoch): accuracies, loss, and the
-    alignment with backprop (mean and per layer; empty on epochs without a
-    probe)."""
+    """One row per (method, seed, epoch): accuracies, loss, the alignment
+    with backprop (mean and per layer; empty on epochs without a probe), and
+    any per-epoch series a run lists under "extra"."""
     import pandas as pd
 
     rows = []
@@ -462,6 +462,7 @@ def results_frame(results, args):
                        "seed": seed, "epoch": epoch, "train": run["train"][i],
                        "test": run["test"][i], "loss": run["loss"][i],
                        "run_time": run.get("time")}
+                row.update({k: v[i] for k, v in run.get("extra", {}).items()})
                 cos = align.get(epoch)
                 if cos is not None:
                     row["align_mean"] = statistics.fmean(cos)
@@ -620,10 +621,14 @@ def add_args(p: argparse.ArgumentParser, archs, default_arch: str):
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
 
-def run(args, build_model):
+def run(args, build_model, train_fn=None):
     """Train every method for every seed, then print a summary and save the
     results table (CSV), the plot (and JSON, if asked). The CSV is rewritten
-    after every run, so a crash keeps the runs finished so far."""
+    after every run, so a crash keeps the runs finished so far.
+
+    `train_fn` (default: `train`) trains one run, with `train`'s signature
+    and history format."""
+    train_fn = train_fn or train
     if args.device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
     (x, y), test = load_cifar10(args.data, args.device)
@@ -641,7 +646,7 @@ def run(args, build_model):
     results = {m: [] for m in args.methods}
     for seed in range(args.seeds):
         for method in args.methods:
-            hist = train(method, data, args, seed, build_model,
+            hist = train_fn(method, data, args, seed, build_model,
                          label=f"seed {seed}  {method:<6}")
             results[method].append(hist)
             print(f"seed {seed}  {method:<6} final train {hist['train'][-1]:6.2f}%  "
