@@ -54,6 +54,8 @@ class DirectFeedback:
         bias: also train the biases.
         reduce: passed to :class:`ThreeFactor`; the default ``"sample"`` gives
             updates on the scale of a mean-loss gradient, so SGD works too.
+        channel_dim: passed to :class:`ThreeFactor`; matters only for layers
+            that use its autograd fallback, with ``reduce="all"``.
         generator: ``torch.Generator`` used to draw ``B`` (for reproducibility).
 
     Each ``B`` is created on the first :meth:`modulate`, when the layer's
@@ -81,6 +83,7 @@ class DirectFeedback:
         scale: float = 1.0,
         bias: bool = True,
         reduce: str = "sample",
+        channel_dim: int = 1,
         generator: Optional[torch.Generator] = None,
     ):
         layers = [layers] if isinstance(layers, nn.Module) else list(layers)
@@ -97,7 +100,8 @@ class DirectFeedback:
         post_fn = derivative if derivative is not None else torch.ones_like
         self.tf = ThreeFactor()
         for layer, post in zip(layers, posts):
-            self.tf.add(layer, post=post, post_fn=post_fn, bias=bias, reduce=reduce)
+            self.tf.add(layer, post=post, post_fn=post_fn, bias=bias, reduce=reduce,
+                        channel_dim=channel_dim)
         self.layers = layers
         self.n_out = n_out
         self.scale = float(scale)
