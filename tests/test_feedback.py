@@ -239,3 +239,28 @@ def test_dfa_wrapped_layer_matches_plain_layer():
         grads.append((conv.weight.grad, conv.bias.grad))
     for a, b in zip(*grads):
         assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_dfa_passes_channel_dim_to_the_fallback():
+    """reduce="all" on a channel-last custom module: with channel_dim=-1 the
+    update matches the same nn.Linear's."""
+
+    class Wrapped(nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layer = layer
+
+        def forward(self, x):
+            return self.layer(x)
+
+    grads = []
+    for wrap in (False, True):
+        torch.manual_seed(0)
+        lin = nn.Linear(5, 3)
+        layer = Wrapped(lin) if wrap else lin
+        dfa = DirectFeedback(layer, n_out=4, derivative=None, reduce="all", channel_dim=-1,
+                             generator=torch.Generator().manual_seed(1))
+        layer(torch.randn(6, 7, 5))
+        dfa.modulate(torch.randn(6, 4))
+        grads.append(lin.weight.grad)
+    assert torch.allclose(*grads, atol=1e-6)

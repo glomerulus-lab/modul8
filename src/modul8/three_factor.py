@@ -83,6 +83,7 @@ class _Site:
         rule: str,
         noise: float,
         reduce: Optional[str] = None,
+        channel_dim: int = 1,
     ):
         # Linear / Conv layers get the closed-form update; any other module
         # gets the same update by autograd (see _vjp).
@@ -128,6 +129,7 @@ class _Site:
         self.rule = rule
         self.noise = float(noise)
         self.reduce = reduce
+        self.channel_dim = channel_dim  # used by the autograd fallback only
         # [pre, post] per forward call; with noise, `post` holds xi / sigma.
         # (For the autograd fallback, `pre` is the tuple of all inputs.)
         self.captures: list[list] = []
@@ -212,7 +214,15 @@ class _Site:
         module's output with ``g = M * post / n``, from re-running the module
         on its captured (detached) inputs. For a Linear / Conv layer this is
         exactly the closed-form ``g x pre``."""
-        g, *_ = self._signal(post, modulator, 1 if post.ndim > 1 else 0)
+        ch = 0
+        if post.ndim > 1:
+            if not -post.ndim <= self.channel_dim < post.ndim:
+                raise ValueError(
+                    f"channel_dim={self.channel_dim} is out of range for "
+                    f"{type(self.module).__name__} output of shape {tuple(post.shape)}"
+                )
+            ch = self.channel_dim % post.ndim
+        g, *_ = self._signal(post, modulator, ch)
         self._replaying = True
         try:
             with torch.enable_grad():
@@ -307,8 +317,7 @@ class ThreeFactor:
             ``nn.Linear`` / ``nn.ConvNd`` layers use the closed-form update;
             any other module with parameters uses the autograd fallback (see
             the module docstring), which trains all of its trainable
-            parameters (those named ``bias`` only with ``bias=True``) and
-            takes the output's dim 1 as its channel dim for ``reduce="all"``.
+            parameters (those named ``bias`` only with ``bias=True``).
         mask: bool tensor broadcastable to the layer's weight. ``True`` entries
             are learned with the Hebbian rule; ``False`` entries keep their
             backprop gradient. ``None`` (default) means the whole weight.
@@ -332,6 +341,13 @@ class ThreeFactor:
             noise) averages over samples and output positions; ``"sample"``
             (the default with noise) averages over samples and sums over
             positions, matching the scale of a mean-loss gradient.
+        channel_dim: for the autograd fallback with ``reduce="all"``, the
+            output dim that holds the channels / features; every other dim
+            is averaged over. Default 1, the layout of a conv; pass ``-1``
+            for a channel-last module, e.g. one whose output is
+            ``(batch, seq, features)``. Ignored for ``nn.Linear`` /
+            ``nn.ConvNd`` layers (features last and channels at dim 1,
+            respectively) and with ``reduce="sample"``.
 
     Usage::
 
@@ -359,6 +375,7 @@ class ThreeFactor:
         rule: str = "hebb",
         noise: float = 0.0,
         reduce: Optional[str] = None,
+        channel_dim: int = 1,
     ):
         self._sites: list[_Site] = []
         if modules is None:
@@ -373,7 +390,7 @@ class ThreeFactor:
         for m in modules:
             self.add(
                 m, mask=mask, bias=bias, post=post, pre_fn=pre_fn, post_fn=post_fn, rule=rule,
-                noise=noise, reduce=reduce,
+                noise=noise, reduce=reduce, channel_dim=channel_dim,
             )
 
     def add(
@@ -388,11 +405,13 @@ class ThreeFactor:
         rule: str = "hebb",
         noise: float = 0.0,
         reduce: Optional[str] = None,
+        channel_dim: int = 1,
     ) -> "ThreeFactor":
         """Put ``module`` under Hebbian control. Returns ``self`` for chaining."""
         if any(s.module is module for s in self._sites):
             raise ValueError("module is already managed by this ThreeFactor")
-        self._sites.append(_Site(module, mask, bias, post, pre_fn, post_fn, rule, noise, reduce))
+        self._sites.append(_Site(module, mask, bias, post, pre_fn, post_fn, rule, noise, reduce,
+                                 channel_dim))
         return self
 
     @torch.no_grad()

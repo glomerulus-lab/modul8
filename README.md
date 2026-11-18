@@ -359,7 +359,10 @@ matrices per layer. The reference code's bio recipes use `beta=0.01` for
   is exactly the closed-form update. The module's forward must be
   deterministic and return one tensor. `mask`, `pre_fn` and `rule="oja"` are
   not supported. Parameters named `bias` are trained only with `bias=True`.
-  With `reduce="all"`, dim 1 of the output is taken as the channel dim.
+  With `reduce="all"`, dim 1 of the output is taken as the channel dim, as
+  for a conv. For a channel-last module, e.g. one with `(batch, seq,
+  features)` output, pass `channel_dim=-1`, or its update is scaled
+  differently from an `nn.Linear`'s.
 
 ## Example: MNIST learning curves
 

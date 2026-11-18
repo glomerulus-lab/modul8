@@ -136,21 +136,71 @@ def _twins(make, seed=0):
 @pytest.mark.parametrize("make,shape", LAYERS)
 @pytest.mark.parametrize("reduce", ["all", "sample"])
 def test_autograd_fallback_matches_closed_form(make, shape, reduce):
-    if reduce == "all" and (make, shape) == LAYERS[1]:
-        pytest.skip("Linear on (batch, seq, features): reduce='all' treats the last dim "
-                    "as features, the fallback treats dim 1 as channels")
     plain, wrapped = _twins(make)
     x = torch.randn(shape)
     out_shape = plain(x).shape
     mod = torch.randn(out_shape)  # per-neuron (and per-position) modulator
+    # A Linear's features are its last dim; convs use the default, dim 1.
+    kwargs = {"channel_dim": -1} if isinstance(plain, nn.Linear) else {}
     for layer in (plain, wrapped):
-        hebb = ThreeFactor(layer, bias=True, post_fn=torch.tanh, reduce=reduce)
+        hebb = ThreeFactor(layer, bias=True, post_fn=torch.tanh, reduce=reduce,
+                           **(kwargs if layer is wrapped else {}))
         layer(x)
         layer(2 * x)  # passes accumulate in both paths
         hebb.modulate(mod)
         hebb.remove()
     assert torch.allclose(wrapped.layer.weight.grad, plain.weight.grad, atol=1e-5)
     assert torch.allclose(wrapped.layer.bias.grad, plain.bias.grad, atol=1e-5)
+
+
+def _seq_grads(channel_dim=None, reduce="all", B=4, T=7, f_in=5, f_out=3):
+    """Weight grads of a plain Linear and a wrapped one on (B, T, f_in) input."""
+    plain, wrapped = _twins(lambda: nn.Linear(f_in, f_out))
+    x, mod = torch.randn(B, T, f_in), torch.randn(B, T, f_out)
+    for layer in (plain, wrapped):
+        kwargs = {} if channel_dim is None or layer is plain else {"channel_dim": channel_dim}
+        hebb = ThreeFactor(layer, reduce=reduce, **kwargs)
+        layer(x)
+        hebb.modulate(mod)
+    return plain.weight.grad, wrapped.layer.weight.grad
+
+
+def test_channel_dim_default_is_dim_1():
+    """Without channel_dim, a channel-last fallback module averages over the
+    wrong dims under reduce="all": same direction, scaled by T / f_out."""
+    plain, wrapped = _seq_grads()
+    assert torch.allclose(wrapped, plain * 7 / 3, atol=1e-5)
+    plain, wrapped = _seq_grads(channel_dim=-1)
+    assert torch.allclose(wrapped, plain, atol=1e-6)
+    plain, wrapped = _seq_grads(channel_dim=2)  # positive index, same dim
+    assert torch.allclose(wrapped, plain, atol=1e-6)
+
+
+def test_channel_dim_irrelevant_with_reduce_sample():
+    plain, wrapped = _seq_grads(reduce="sample")
+    assert torch.allclose(wrapped, plain, atol=1e-6)
+
+
+def test_channel_dim_ignored_for_linear_and_conv():
+    torch.manual_seed(0)
+    for make, shape in (LAYERS[1], LAYERS[2]):
+        grads = []
+        for cd in (1, -1):
+            torch.manual_seed(0)
+            layer, x = make(), torch.randn(shape)
+            hebb = ThreeFactor(layer, channel_dim=cd)
+            layer(x)
+            hebb.modulate(0.5)
+            grads.append(layer.weight.grad)
+        assert torch.equal(*grads)
+
+
+def test_channel_dim_out_of_range():
+    layer = Wrapped(nn.Linear(3, 2))
+    hebb = ThreeFactor(layer, channel_dim=3)
+    layer(torch.randn(4, 3))
+    with pytest.raises(ValueError, match="channel_dim"):
+        hebb.modulate(1.0)
 
 
 def test_autograd_fallback_with_post_module_and_noise():
