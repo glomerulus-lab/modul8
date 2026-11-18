@@ -214,14 +214,13 @@ class _Site:
         module's output with ``g = M * post / n``, from re-running the module
         on its captured (detached) inputs. For a Linear / Conv layer this is
         exactly the closed-form ``g x pre``."""
-        ch = 0
-        if post.ndim > 1:
-            if not -post.ndim <= self.channel_dim < post.ndim:
-                raise ValueError(
-                    f"channel_dim={self.channel_dim} is out of range for "
-                    f"{type(self.module).__name__} output of shape {tuple(post.shape)}"
-                )
-            ch = self.channel_dim % post.ndim
+        # A 1-D (unbatched) output has a single dim; the default dim 1 would not exist.
+        ch = self.channel_dim if post.ndim > 1 else 0
+        if not -post.ndim <= ch < post.ndim:
+            raise ValueError(
+                f"channel_dim={ch} is out of range for "
+                f"{type(self.module).__name__} output of shape {tuple(post.shape)}"
+            )
         g, *_ = self._signal(post, modulator, ch)
         self._replaying = True
         try:
